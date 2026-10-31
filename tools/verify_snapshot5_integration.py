@@ -101,7 +101,7 @@ def native_helper_uuid(entity):
 
 
 def same_native_value(first, second):
-    """Keep every decoded field, including signed zero and numeric value kinds."""
+    """Compare decoded values, including signed zero; native NBT tag kinds are not retained."""
     if type(first) is not type(second):
         return False
     if isinstance(first, dict):
@@ -111,6 +111,201 @@ def same_native_value(first, second):
     if isinstance(first, float):
         return math.isfinite(first) and math.isfinite(second) and struct.pack(">d", first) == struct.pack(">d", second)
     return first == second
+
+
+# Mounted helpers (inside another entity's nested Passengers) cannot yet be
+# verified from a copied save, so the release gate asks for inspection instead.
+# Bounds keep malformed, shared or cyclic decoded trees from hanging the gate.
+NESTED_PASSENGER_DEPTH_LIMIT = 16
+NESTED_PASSENGER_NODE_LIMIT = 4096
+HELPER_LIKE_MESSAGE = ("a {role} is or may be a helper; inspect the private copied world manually, "
+                       "mounted helpers are not yet verifiable release evidence")
+# Offline player saves may hold a mounted vehicle tree under RootVehicle.Entity.
+PLAYER_DATA_DIRECTORY = "players/data/"
+PLAYER_DATA_FILE_LIMIT = 4096
+PLAYER_SAVE_BYTE_LIMIT = 64 * 1024 * 1024
+
+
+def native_uuid_words(raw):
+    return (isinstance(raw, list) and len(raw) == 4
+            and all(type(value) is int and -(2 ** 31) <= value < 2 ** 31 for value in raw))
+
+
+def canonical_player_save(name):
+    """Identify an active native UUID-named player save, not only a backup or stats file."""
+    path = Path(name)
+    if path.suffix != ".dat":
+        return False
+    try:
+        return str(uuid.UUID(path.stem)) == path.stem
+    except ValueError:
+        return False
+
+
+def strict_entity_identity(node, role="nested passenger"):
+    """Strictly derive a mounted entity's native identity or fail closed."""
+    require(not any(key in node for key in ("uuid", "UUIDMost", "UUIDLeast")),
+            "ambiguous " + role + " identity")
+    raw = node.get("UUID")
+    require(native_uuid_words(raw), "missing or malformed " + role + " identity")
+    return str(uuid.UUID(bytes=b"".join(struct.pack(">i", value) for value in raw)))
+
+
+def strict_entity_tags(node, role):
+    """Absent Tags is an empty list; anything else must be a list of strings."""
+    tags = node.get("Tags", [])
+    require(isinstance(tags, list) and all(isinstance(tag, str) for tag in tags),
+            "malformed " + role + " tags")
+    return tags
+
+
+def reject_helper_like(node, registered, role="nested passenger"):
+    """Fail closed on malformed tags/identity, an infinity_agent tag or a flagged UUID.
+
+    `registered` is every helper-like identity: active registrations plus
+    reserved dismissed/guarded-removal identities. Returns the strict identity.
+    """
+    tags = strict_entity_tags(node, role)
+    identity = strict_entity_identity(node, role)
+    require("infinity_agent" not in tags and identity not in registered, HELPER_LIKE_MESSAGE.format(role=role))
+    return identity
+
+
+def verify_nested_passengers(entity, registered):
+    """Reject any helper-like rider below one top-level region entity, player vehicle or shoulder.
+
+    Walks the whole nested Passengers tree (not the root itself, whose checks
+    stay with the caller). A rider tagged
+    infinity_agent or whose identity matches a flagged helper identity is rejected;
+    this does not assert mounted helpers are invalid in Minecraft, only that
+    this offline verifier cannot verify them yet. Malformed containers, nodes,
+    tags or identities, excessive depth/size and shared or cyclic nodes are
+    rejected too. Read-only; messages never include identities or NBT.
+    Returns the strict identities of every nested rider (root excluded).
+    """
+    require(isinstance(entity, dict), "malformed top-level saved entity")
+    seen = {id(entity)}
+    stack = [(entity, 0)]
+    count = 0
+    identities = []
+    while stack:
+        node, depth = stack.pop()
+        if "Passengers" not in node:
+            continue
+        riders = node["Passengers"]
+        require(isinstance(riders, list) and id(riders) not in seen, "malformed or cyclic passenger container")
+        seen.add(id(riders))
+        require(depth < NESTED_PASSENGER_DEPTH_LIMIT, "passenger nesting exceeds verifier limit; inspect manually")
+        for passenger in riders:
+            count += 1
+            require(count <= NESTED_PASSENGER_NODE_LIMIT, "too many nested passengers; inspect manually")
+            require(isinstance(passenger, dict), "malformed nested passenger")
+            require(id(passenger) not in seen, "cyclic or shared nested passenger")
+            seen.add(id(passenger))
+            identities.append(reject_helper_like(passenger, registered))
+            stack.append((passenger, depth + 1))
+    return identities
+
+
+def offline_player_data_files(world):
+    """Enumerate the actual players/data entries on disk; never trust a manifest listing alone.
+
+    Returns manifest-style relative names only. Subdirectories, symlinks or a
+    populated legacy playerdata/ directory cannot be verified here and fail closed.
+    """
+    legacy = world / "playerdata"
+    require(not legacy.is_symlink() and (not legacy.exists() or (legacy.is_dir() and not any(legacy.iterdir()))),
+            "legacy offline player layout cannot be verified; inspect manually")
+    players, folder = world / "players", world / "players" / "data"
+    require(not players.is_symlink() and not folder.is_symlink(), "malformed offline player data directory")
+    if not folder.exists():
+        return set()
+    require(folder.is_dir(), "malformed offline player data directory")
+    names = set()
+    for entry in folder.iterdir():
+        require(len(names) < PLAYER_DATA_FILE_LIMIT, "too many offline player files; inspect manually")
+        require(entry.is_file() and not entry.is_symlink(), "unexpected offline player data entry")
+        names.add(PLAYER_DATA_DIRECTORY + entry.name)
+    return names
+
+
+def decode_bounded_nbt(storage, path, what):
+    """Decode one gzip save with the bounded native parser without following symlinks; errors stay generic."""
+    require(not path.is_symlink() and path.is_file() and 0 < path.stat().st_size <= PLAYER_SAVE_BYTE_LIMIT,
+            "missing or oversized " + what)
+    try:
+        return storage.saved_nbt(path)
+    except Exception:
+        raise ValueError("Snapshot integration: " + what + " could not be decoded; inspect manually") from None
+
+
+def decode_offline_player_save(storage, path):
+    return decode_bounded_nbt(storage, path, "offline player save")
+
+
+def optional_level_backup(storage, world):
+    """Decode level.dat_old when present (absence is legitimate); return its Data compound."""
+    path = world / "level.dat_old"
+    if not path.is_symlink() and not path.exists():
+        return None
+    backup = decode_bounded_nbt(storage, path, "level backup")
+    require(isinstance(backup, dict) and isinstance(backup.get("Data"), dict), "malformed level backup")
+    return backup["Data"]
+
+
+def verify_offline_player_save(player, registered):
+    """Reject a helper-like RootVehicle tree or shoulder entity in one player compound.
+
+    Used for players/data saves and level.dat(_old) Data.Player. Absent
+    RootVehicle and absent/empty shoulders are ordinary. Saves using shapes this
+    gate does not support (extra RootVehicle keys, legacy identities, unresolved
+    attachments, non-compound shoulders) are rejected for manual inspection even
+    if Minecraft might accept them. Inspects these fields only; it is not proof of
+    global entity completeness, durability or crash recovery.
+    """
+    require(isinstance(player, dict), "malformed offline player save")
+    for side in ("ShoulderEntityLeft", "ShoulderEntityRight"):
+        if side not in player:
+            continue
+        shoulder = player[side]
+        require(isinstance(shoulder, dict), "malformed offline player shoulder entity")
+        if shoulder:
+            reject_helper_like(shoulder, registered, "player shoulder entity")
+            verify_nested_passengers(shoulder, registered)
+    if "RootVehicle" not in player:
+        return
+    vehicle = player["RootVehicle"]
+    require(isinstance(vehicle, dict) and set(vehicle) == {"Attach", "Entity"},
+            "malformed offline player RootVehicle")
+    require(native_uuid_words(vehicle["Attach"]), "malformed offline player RootVehicle attachment")
+    entity = vehicle["Entity"]
+    require(isinstance(entity, dict), "malformed offline player RootVehicle entity")
+    root_identity = reject_helper_like(entity, registered, "player root vehicle")
+    attachment = str(uuid.UUID(bytes=b"".join(struct.pack(">i", value) for value in vehicle["Attach"])))
+    require(attachment not in registered, "offline player vehicle attachment may reference a helper; inspect manually")
+    tree = [root_identity, *verify_nested_passengers(entity, registered)]
+    require(len(set(tree)) == len(tree), "duplicate identity in offline player vehicle tree; inspect manually")
+    require(attachment in tree, "offline player vehicle attachment does not resolve in its vehicle tree; inspect manually")
+
+
+def verify_top_level_entity(entity, wanted, reserved):
+    """Strict root checks for one region entity; returns its identity and tags.
+
+    Uses strict native UUID identity (ambiguous lowercase/legacy fields rejected)
+    and list-of-strings tags, and rejects reserved dismissed identities. Registered
+    helper, duplicate and unregistered-tag handling stay with the caller.
+    """
+    verify_nested_passengers(entity, wanted | reserved)
+    role = "top-level saved entity"
+    tags = strict_entity_tags(entity, role)
+    identity = strict_entity_identity(entity, role)
+    require(identity not in reserved, HELPER_LIKE_MESSAGE.format(role=role))
+    return identity, tags
+
+
+def reserved_helper_identities(registrations):
+    """Dismissed and guarded-removal identities from an already validated roster."""
+    return set(registrations.get("dismissed", [])) | set(registrations.get("guardedRemovals", []))
 
 
 def validate_helper_registrations(registrations):
@@ -124,13 +319,6 @@ def validate_helper_registrations(registrations):
         except (ValueError, AttributeError):
             canonical = False
         require(canonical, "noncanonical registered helper identity")
-    if registrations["format"] == 2:
-        require("guardedRemovals" not in registrations, "old helper roster cannot assert new removal provenance")
-        return
-    dismissed = registrations.get("dismissed")
-    guarded = registrations.get("guardedRemovals")
-    require(isinstance(dismissed, list) and isinstance(guarded, list)
-            and len(dismissed) <= 256 and len(guarded) <= 256, "invalid removal provenance lists")
     def identities(values):
         result = set()
         for value in values:
@@ -141,6 +329,18 @@ def validate_helper_registrations(registrations):
             require(valid and value not in result and value not in registrations["agents"], "invalid removal provenance identity")
             result.add(value)
         return result
+    if registrations["format"] == 2:
+        require("guardedRemovals" not in registrations, "old helper roster cannot assert new removal provenance")
+        if "dismissed" in registrations:
+            # Old rosters may carry dismissed identities; the evidence gate reserves them.
+            require(isinstance(registrations["dismissed"], list) and len(registrations["dismissed"]) <= 256,
+                    "invalid removal provenance lists")
+            identities(registrations["dismissed"])
+        return
+    dismissed = registrations.get("dismissed")
+    guarded = registrations.get("guardedRemovals")
+    require(isinstance(dismissed, list) and isinstance(guarded, list)
+            and len(dismissed) <= 256 and len(guarded) <= 256, "invalid removal provenance lists")
     reserved, proven = identities(dismissed), identities(guarded)
     require(proven <= reserved, "unreserved guarded removal provenance")
     pending = registrations.get("pendingCreations")
@@ -259,6 +459,13 @@ def native_world(root, base, label, evidence):
     originals = manifest["original_fixture_files"]
     require(len(originals) == manifest["input_file_count"] == result["input_file_count"] and len(originals) > 0,
             "conversion input file count changed")
+    # Actual on-disk player-save inventory of BOTH worlds must equal the manifest's
+    # (checked before hashing so a missing save fails with a generic message).
+    player_saves = {name for name in originals if name.startswith(PLAYER_DATA_DIRECTORY)}
+    require(offline_player_data_files(before) == player_saves == offline_player_data_files(after),
+            "offline player data inventory differs between copied worlds or from the manifest")
+    require(any(canonical_player_save(name) for name in player_saves),
+            "offline player data lacks an active UUID-named save; inspect manually")
     for relative, expected in originals.items():
         path = (before / relative).resolve()
         require(before.resolve() in path.parents and digest(path) == expected, "original conversion file changed")
@@ -287,14 +494,36 @@ def native_world(root, base, label, evidence):
     wanted = {helper["uuid"] for helper in helpers}
     require(wanted and len(wanted) == len(helpers) == len(semantics["helper_comparison"]), "missing copied helper comparison")
     require(wanted == set(registrations["agents"]), "copied helper comparison omitted or invented a registered helper")
+    # Dismissed/guarded-removal identities are reserved helper-like identities for
+    # this evidence gate even without tags; nothing is marked or removed at runtime.
+    reserved = reserved_helper_identities(registrations)
+    flagged = wanted | reserved
+    # Decode every actual player save in both worlds; byte equality above does not
+    # inspect a mounted RootVehicle tree, and no receipt boolean replaces this.
+    for world in (before, after):
+        for name in sorted(player_saves):
+            verify_offline_player_save(decode_offline_player_save(storage, world / name), flagged)
+    # A level.dat host player (and optional level.dat_old backups) can hold the
+    # same vehicle/shoulder trees as players/data saves.
+    hosts = [old_level, new_level]
+    for world in (before, after):
+        backup = optional_level_backup(storage, world)
+        if backup is not None:
+            hosts.append(backup)
+    for level in hosts:
+        require(isinstance(level, dict), "malformed level data")
+        if "Player" in level:
+            verify_offline_player_save(level["Player"], flagged)
     def entities(world):
         found = {}
         for file in world.rglob("entities/r.*.mca"):
             for record in storage.region_records(file):
                 nbt = storage.NBT(storage.unpack(record[4], record[5])).parse()
                 for entity in nbt.get("Entities", []):
-                    key = storage.identity(entity)
-                    require("infinity_agent" not in entity.get("Tags", []) or key in wanted,
+                    # Actual traversal of every top-level entity in both worlds;
+                    # no receipt boolean can stand in for this check.
+                    key, tags = verify_top_level_entity(entity, wanted, reserved)
+                    require("infinity_agent" not in tags or key in wanted,
                             "unregistered tagged helper in copied world")
                     if key in wanted:
                         require(key not in found, "duplicate helper UUID in copied world")
@@ -315,7 +544,8 @@ def native_world(root, base, label, evidence):
     return {"source_data_version": old_level["DataVersion"], "target_data_version": 5125,
             "input_files": len(originals), "offline_player_files": len(players), "mod_state_files": len(mods),
             "helpers": len(wanted), "offline_player_bytes_preserved": True, "mod_state_preserved": True,
-            "helper_stable_fields_preserved": True, "difficulty_preserved": True,
+            "helper_decoded_fields_preserved": True, "helper_native_nbt_tag_kinds_verified": False,
+            "difficulty_preserved": True,
             "original_copy_unchanged": True, "no_player_logins": True, "terrain_refreshed": False,
             "helper_default_migration": {
                 "migrated_helpers": sum(row["migration_applied"] for row in migration_observations),
@@ -405,7 +635,7 @@ def collect(root=ROOT):
         "bridge_integration": digest(base / "upstream-bridge/integration-proof.json"), "translated_play": digest(positive_path),
         "app_run": digest(base / "snapshot5-crossplay-lab/final-app-run.json"), "ack_result": digest(base / "viafabric-ack-runtime/result-final.json"), "ack_report": digest(ack_xml)})
     world = native_world(root, base, mods, evidence)
-    return {"format_version": 1, "version": VERSION, "minecraft": MINECRAFT, "protocol": PROTOCOL, "experimental": True,
+    return {"format_version": 2, "version": VERSION, "minecraft": MINECRAFT, "protocol": PROTOCOL, "experimental": True,
             "snapshot5_inputs": inputs, "source_hashes": {name: digest(root / name) for name in SOURCE_FILES},
             "dependency_lock_sha256": digest(root / "server/dependencies.lock.json"), "runtime_mod_sha256": mods,
             "native_tests": len(native_names), "codec_tests": len(names),
