@@ -546,6 +546,118 @@ public class HelperBatchGameTests {
         c.succeed();
     }
 
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=240)
+    public void conflictingSavedOwnerOrNameTagsFreezeWithoutRewritingTheBody(GameTestHelper c) throws Exception {
+        for (boolean pending : new boolean[]{false, true}) for (String conflict : List.of("owner", "name", "extra owner", "extra name")) {
+            try (var f = new Fixture(c)) {
+                f.unloaded(f.owner.getUUID(), 1, "saved-"); var entry = f.helpers.owned(f.owner, "saved-1");
+                String id = entry.getKey(); var record = entry.getValue();
+                if (pending) { f.helpers.data.pendingCreations.add(id); f.helpers.save(); }
+                byte[] roster = Files.readAllBytes(f.helpers.file), previous = Files.readAllBytes(f.previousFile());
+                var restarted = f.restart(); var body = f.saved(UUID.fromString(id));
+                body.setHealth(37); body.getAttribute(Attributes.MOVEMENT_SPEED).setBaseValue(.31);
+                body.setCustomName(Component.literal("Keep the saved name"));
+                String ownerTag = "infinity_owner_" + record.owner(), nameTag = "infinity_name_" + record.name();
+                if (!conflict.equals("owner")) body.addTag(ownerTag);
+                if (!conflict.equals("name")) body.addTag(nameTag);
+                if (conflict.equals("owner") || conflict.equals("extra owner")) body.addTag("infinity_owner_" + UUID.randomUUID());
+                if (conflict.equals("name") || conflict.equals("extra name")) body.addTag("infinity_name_another_helper");
+                var originalTags = Set.copyOf(body.entityTags());
+                var admin = (AdminStatEntity) body; var metadata = admin.infinity$adminStats();
+                metadata.putInt("synthetic_edit", 77); admin.infinity$adminStats(metadata); var originalStats = admin.infinity$adminStats().copy();
+                restarted.load(body);
+                String label = (pending ? "pending " : "legacy ") + conflict;
+                c.assertTrue(restarted.creationRecoveryRequired && Files.exists(f.marker()) && f.restart().creationRecoveryRequired,
+                    "Contradictory saved ownership freezes now and after restart: " + label);
+                c.assertTrue(!body.isRemoved() && body.getHealth() == 37 && body.getAttributeBaseValue(Attributes.MOVEMENT_SPEED) == .31,
+                    "The body and edited values are retained: " + label);
+                c.assertTrue(originalTags.equals(body.entityTags()) && body.getCustomName().getString().equals("Keep the saved name")
+                        && originalStats.equals(admin.infinity$adminStats()), "Frozen loading does not rewrite the saved name, tags or stat metadata: " + label);
+                c.assertTrue(Arrays.equals(roster, Files.readAllBytes(f.helpers.file)) && Arrays.equals(previous, Files.readAllBytes(f.previousFile())),
+                    "The roster and its previous copy are not changed: " + label);
+                restarted.loaded.remove(body.getUUID(), body); body.discard();
+            }
+        }
+        c.succeed();
+    }
+
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=180)
+    public void failedOwnerNoticeDoesNotEscapeTheDeathRecordCallback(GameTestHelper c) throws Exception {
+        try (var f = new Fixture(c)) {
+            f.unloaded(f.owner.getUUID(), 1, "saved-"); var entry = f.helpers.owned(f.owner, "saved-1");
+            byte[] roster = Files.readAllBytes(f.helpers.file), previous = Files.readAllBytes(f.previousFile());
+            var listener = f.owner.connection;
+            try { f.owner.connection = null; f.helpers.recordDeath(entry.getKey()); }
+            finally { f.owner.connection = listener; }
+            c.assertTrue(f.helpers.data.agents.get(entry.getKey()) == entry.getValue() && !f.helpers.creationRecoveryRequired
+                    && Arrays.equals(roster, Files.readAllBytes(f.helpers.file)) && Arrays.equals(previous, Files.readAllBytes(f.previousFile())),
+                "A failed owner notice does not escape or alter the preserved death record");
+        }
+        c.succeed();
+    }
+
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=180)
+    public void tagConflictStillPreservesBodyWhenOwnerNoticeThrows(GameTestHelper c) throws Exception {
+        try (var f = new Fixture(c)) {
+            f.unloaded(f.owner.getUUID(), 1, "saved-"); var entry = f.helpers.owned(f.owner, "saved-1");
+            var restarted = f.restart(); var body = f.saved(UUID.fromString(entry.getKey()));
+            body.addTag("infinity_name_other_helper"); body.setCustomName(Component.literal("Keep this name"));
+            var tags = Set.copyOf(body.entityTags()); var listener = f.owner.connection;
+            try { f.owner.connection = null; restarted.load(body); }
+            finally { f.owner.connection = listener; }
+            c.assertTrue(restarted.creationRecoveryRequired && Files.exists(f.marker()) && !body.isRemoved()
+                    && tags.equals(body.entityTags()) && body.getCustomName().getString().equals("Keep this name"),
+                "A failed notice cannot escape the load callback or rewrite the conflicting body");
+            restarted.loaded.remove(body.getUUID(), body); body.discard();
+        }
+        c.succeed();
+    }
+
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=180)
+    public void tagConflictFreezesAgainWhenStorageCannotLeaveARecoveryNote(GameTestHelper c) throws Exception {
+        var io = new FaultyIo();
+        try (var f = new Fixture(c)) {
+            f.unloaded(f.owner.getUUID(), 1, "saved-"); var entry = f.helpers.owned(f.owner, "saved-1");
+            f.helpers.data.pendingCreations.add(entry.getKey()); f.helpers.save();
+            io.blockMarkerWrites = true;
+            var first = f.restart(io); var body = f.saved(UUID.fromString(entry.getKey()));
+            String wrong = "infinity_owner_" + UUID.randomUUID(); body.addTag(wrong);
+            first.load(body);
+            c.assertTrue(first.creationRecoveryRequired && !HelperPersistence.recoveryRequired(f.helpers.file)
+                    && body.entityTags().contains(wrong) && !body.isRemoved(),
+                "A note-write failure freezes this runtime but preserves the contradictory body without pretending the note exists");
+            first.loaded.remove(body.getUUID(), body); body.discard();
+            var again = f.restart(io);
+            c.assertFalse(again.creationRecoveryRequired, "Without surviving evidence, the next runtime cannot know before the body loads");
+            var later = f.saved(UUID.fromString(entry.getKey())); later.addTag(wrong); again.load(later);
+            c.assertTrue(again.creationRecoveryRequired && !later.isRemoved() && later.entityTags().contains(wrong),
+                "The still-contradictory body freezes the next runtime when encountered");
+            again.loaded.remove(later.getUUID(), later); later.discard();
+        }
+        c.succeed();
+    }
+
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=180)
+    public void absentOrStaleMutableTagsDoNotBecomeIdentityConflicts(GameTestHelper c) throws Exception {
+        for (boolean present : new boolean[]{false, true}) {
+            try (var f = new Fixture(c)) {
+                f.unloaded(f.owner.getUUID(), 1, "saved-"); var entry = f.helpers.owned(f.owner, "saved-1");
+                f.helpers.data.pendingCreations.add(entry.getKey()); f.helpers.save();
+                var restarted = f.restart(); var body = f.saved(UUID.fromString(entry.getKey()));
+                if (present) {
+                    body.addTag("infinity_owner_" + entry.getValue().owner()); body.addTag("infinity_name_" + entry.getValue().name());
+                    body.addTag("infinity_mode_guard"); body.addTag("infinity_profile_debug");
+                }
+                restarted.load(body);
+                c.assertTrue(!restarted.creationRecoveryRequired && !body.isRemoved() && restarted.loaded.get(body.getUUID()) == body,
+                    "Missing identity tags or stale mutable mode/profile tags do not trigger a conflicting identity: " + present);
+                c.assertTrue(restarted.unresolvedCreation(entry.getKey()), "The load is not proof of on-disk entity durability");
+                restarted.loaded.remove(body.getUUID(), body); body.discard();
+            }
+        }
+        c.succeed();
+    }
+
     @GameTest(structure="convergence_tests:combat_arena", maxTicks=180)
     public void pendingCreationSurvivesRestartWithoutDeletingRealUnloadedHelpers(GameTestHelper c) throws Exception {
         try (var f = new Fixture(c)) {
