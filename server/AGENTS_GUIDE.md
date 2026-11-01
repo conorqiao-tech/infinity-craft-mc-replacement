@@ -187,6 +187,8 @@ Before inserting new helpers, creation first establishes a durable recovery guar
 
 If helper ownership freezes, preserve the roster, its `.previous` copy and any `.recovery-required` or `.recovery-required.tmp` note for investigation with the matching world data. An unfinished temporary note also freezes ownership, even if no final note exists. Do not remove these files to make the warning disappear. If storage cannot leave any recovery note, a restart cannot be guaranteed to remain frozen.
 
+When a saved helper's owner or name tag explicitly conflicts with its roster record, ownership freezes before those identity tags, its saved name or stat defaults are rewritten. The body and record remain for host review. Matching or missing tags do not prove that a UUID is unique, that an entity reached disk, or that a pending creation is resolved; mode and profile tags can be stale after an interrupted update.
+
 ## Reviewed code changes
 
 Set a helper to CLI, then use `/agent code <name> <request>` to save a plain-text change request (up to 500 characters). It writes a private review record with the world, not an executable patch. Do not include secrets. `/agent code-pending` shows your requests; `/agent code-approve <id>` approves the exact saved text; `/agent code-cancel <id>` cancels it. Requests expire after 24 hours, with three active requests per owner and 16 server-wide.

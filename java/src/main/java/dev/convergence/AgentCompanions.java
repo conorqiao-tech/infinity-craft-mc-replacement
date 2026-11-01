@@ -546,6 +546,13 @@ public final class AgentCompanions {
         golem.refreshDimensions();
         golem.setCustomName(Component.literal(agent.name + " [" + agent.profile.label + "]")); golem.setCustomNameVisible(true); AgentAvatars.attach(golem);
     }
+    /** Explicitly contradictory immutable identity tags are evidence, not authority to retag the body. */
+    static boolean conflictingIdentityTags(IronGolem golem, Agent agent) {
+        String owner = "infinity_owner_" + agent.owner, name = "infinity_name_" + agent.name;
+        return golem.entityTags().stream().anyMatch(tag ->
+            (tag.startsWith("infinity_owner_") && !tag.equals(owner))
+                || (tag.startsWith("infinity_name_") && !tag.equals(name)));
+    }
     void load(Entity entity) {
         if (!isAgent(entity)) return;
         var golem = (IronGolem) entity;
@@ -564,12 +571,15 @@ public final class AgentCompanions {
             notifyRecoveryOwner(golem.getStringUUID(), "Multiple helper bodies have the same identity. Both were kept and the identity still uses a helper slot; ask the host to inspect them. " + FROZEN);
             return;
         }
+        boolean tagConflict = !creationRecoveryRequired && conflictingIdentityTags(golem, agent);
+        if (tagConflict) freeze("a saved helper's owner or name tag conflicts with its roster identity", null);
         if (creationRecoveryRequired) {
             // The roster may name an uncertain body. Stop its behavior without
             // applying profile defaults or rewriting saved ownership/name tags.
             halt(golem); golem.removeFreeWill();
             ((AgentGoalAccess) golem).infinity$getTargetSelector().removeAllGoals(goal -> true);
             golem.setPersistenceRequired(); loaded.put(golem.getUUID(), golem);
+            if (tagConflict) notifyRecoveryOwner(golem.getStringUUID(), "A saved helper's identity tags conflict with the roster. Its body and record are being retained for host review. " + FROZEN);
             return;
         }
         prepare(golem); tags(golem, agent); loaded.put(golem.getUUID(), golem);
@@ -1078,10 +1088,14 @@ public final class AgentCompanions {
         notifyRecoveryOwner(id, (pending ? "Unverified helper " : "Helper ") + agent.name + " died. Its saved identity remains reserved and still uses a helper slot; ask the host to inspect it. Nothing was recreated or moved, and your other helpers are unaffected.");
     }
     private void notifyRecoveryOwner(String id, String notice) {
-        var agent = data.agents.get(id);
-        if (agent == null) return;
-        var owner = server.getPlayerList().getPlayer(UUID.fromString(agent.owner));
-        if (owner != null) reply(owner, notice);
+        try {
+            var agent = data.agents.get(id);
+            if (agent == null) return;
+            var owner = server.getPlayerList().getPlayer(UUID.fromString(agent.owner));
+            if (owner != null) reply(owner, notice);
+        } catch (RuntimeException failure) {
+            org.slf4j.LoggerFactory.getLogger("Infinity helpers").warn("Could not notify a helper owner; inspect the roster and server log for recovery status", failure);
+        }
     }
     /** The exact loaded object, not merely its UUID, owns the death callback. */
     void handleDeath(IronGolem golem) {
