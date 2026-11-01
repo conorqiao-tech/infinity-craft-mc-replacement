@@ -339,6 +339,10 @@ public final class AgentCompanions {
      */
     Commit commit(Runnable change, Save policy, boolean keepPrevious) {
         if (creationRecoveryRequired) return Commit.BLOCKED;
+        if (policy == Save.GUARDED && !HelperPersistence.guardIntact(file)) {
+            freeze("a guarded write lost or conflicted with its recovery note", null);
+            return Commit.BLOCKED;
+        }
         // A roster this runtime read or wrote that is no longer provably present
         // was lost or replaced outside this runtime. Writing a fresh one would let
         // the next save rotate it over .previous, so refuse before touching disk.
@@ -377,8 +381,8 @@ public final class AgentCompanions {
         try { persistence.beginGuard(file, clock.instant() + " " + reason); return null; }
         catch (HelperPersistence.Failure failure) {
             if (!failure.mayHaveChanged && !HelperPersistence.recoveryRequired(file))
-                return "This server's storage could not durably record a safe removal, so nothing was changed.";
-            freeze("a removal marker may or may not have been written", failure);
+                return "This server's storage could not durably record a safe operation, so nothing was changed.";
+            freeze("a recovery guard may or may not have been written", failure);
             return "The saved roster was not changed, but a recovery note may have been left. " + FROZEN;
         }
     }
@@ -804,7 +808,7 @@ public final class AgentCompanions {
      * is frozen and its records and entities are kept for host review.
      */
     private enum Creation { CREATED, NOT_SAVED, NOT_INSERTED, FROZEN, UNRESOLVED }
-    static final String UNRESOLVED_CREATION = "Helper creation failed partway and its ownership could not be safely rolled back. ";
+    static final String UNRESOLVED_CREATION = "Helper creation could not be fully confirmed. ";
     /**
      * The durable roster records every new identity as pending before insertion.
      * A crash can still leave a pending entry without a saved entity. Pending
@@ -812,10 +816,28 @@ public final class AgentCompanions {
      * recreated: only an independent future disk verification can resolve them.
      */
     private Creation create(ServerLevel world, LinkedHashMap<IronGolem, Agent> staged) {
-        var result = commit(() -> staged.forEach((golem, agent) -> {
-            String id = golem.getStringUUID(); data.agents.put(id, agent); data.pendingCreations.add(id);
-        }), Save.CREATION, true);
-        if (result != Commit.PROVEN) return result == Commit.UNTOUCHED ? Creation.NOT_SAVED : Creation.FROZEN;
+        // Establish evidence before the roster or the world can change, so
+        // insertion failures do not have to create the first note afterwards.
+        if (guard("creating helpers") != null) return Creation.NOT_SAVED;
+        Commit result;
+        try {
+            result = commit(() -> staged.forEach((golem, agent) -> {
+                String id = golem.getStringUUID(); data.agents.put(id, agent); data.pendingCreations.add(id);
+            }), Save.CREATION, true);
+        } catch (RuntimeException failure) {
+            freeze("helper creation ownership could not be saved safely", failure);
+            return Creation.FROZEN;
+        }
+        if (result != Commit.PROVEN) {
+            // With a provably untouched roster, no helper entered the world.
+            // Any unretired guard still freezes through unguard().
+            if (result == Commit.UNTOUCHED && !creationRecoveryRequired) unguard();
+            return result == Commit.UNTOUCHED ? Creation.NOT_SAVED : Creation.FROZEN;
+        }
+        if (!HelperPersistence.guardIntact(file)) {
+            freeze("the helper creation guard changed before insertion", null);
+            return Creation.FROZEN;
+        }
         RuntimeException refused = null;
         try {
             for (var entry : staged.entrySet()) {
@@ -830,15 +852,18 @@ public final class AgentCompanions {
                 loaded.put(golem.getUUID(), golem);
             }
         } catch (RuntimeException failure) { refused = failure; }
-        if (refused == null) return Creation.CREATED;
+        if (refused == null) {
+            if (unguard()) return Creation.CREATED;
+            creationUnresolved = true;
+            return Creation.UNRESOLVED;
+        }
         var rollback = Commit.UNTOUCHED;
         try {
             // Only this creation's brand-new identities are removed, and only after
             // their removal proof is proven durable. The creation save already
             // retained the original .previous file; do not replace that recovery
             // copy with the failed staged roster.
-            boolean guarded = guard("rolling back a failed helper creation") == null;
-            if (guarded) rollback = commit(() -> staged.keySet().forEach(golem -> {
+            if (!creationRecoveryRequired) rollback = commit(() -> staged.keySet().forEach(golem -> {
                 data.agents.remove(golem.getStringUUID()); data.pendingCreations.remove(golem.getStringUUID()); rememberRemoved(golem.getStringUUID());
             }), Save.GUARDED, false);
             if (rollback == Commit.PROVEN && unguard()) {

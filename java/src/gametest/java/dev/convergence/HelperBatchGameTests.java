@@ -38,6 +38,10 @@ public class HelperBatchGameTests {
     private static final AtomicReference<InsertionFailure> INSERTION_FAILURE = new AtomicReference<>();
     private record InsertionObserver(AgentCompanions helpers, List<String> seen) {}
     private static final AtomicReference<InsertionObserver> INSERTION_OBSERVER = new AtomicReference<>();
+    private record GuardFailure(AgentCompanions helpers, UUID owner, FaultyIo io, AtomicReference<UUID> inserted) {}
+    private static final AtomicReference<GuardFailure> GUARD_FAILURE = new AtomicReference<>();
+    private record CompetingNote(AgentCompanions helpers, UUID owner, AtomicReference<UUID> inserted) {}
+    private static final AtomicReference<CompetingNote> COMPETING_NOTE = new AtomicReference<>();
     static {
         // Test-only, one-shot listener: unrelated worlds, owners and entities
         // never enter this fault. No production API or hook is introduced.
@@ -52,6 +56,27 @@ public class HelperBatchGameTests {
             catch (java.io.IOException failure) { throw new IllegalStateException("Could not establish the private rollback fault", failure); }
             throw new IllegalStateException("Exact-owner one-shot native entity insertion fault");
         });
+        ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> {
+            var fault = GUARD_FAILURE.get();
+            if (fault == null || fault.helpers.server != world.getServer() || !AgentCompanions.isAgent(entity)) return;
+            var record = fault.helpers.data.agents.get(entity.getStringUUID());
+            if (record == null || !record.owner().equals(fault.owner.toString()) || !record.name().equals("guarded")) return;
+            if (!GUARD_FAILURE.compareAndSet(fault, null)) return;
+            fault.inserted.set(entity.getUUID());
+            fault.io.blockMarkerWrites = true;
+            fault.io.blockRosterWrites = true;
+            throw new IllegalStateException("Exact-owner partial insertion with subsequent storage writes refused");
+        });
+        ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> {
+            var fault = COMPETING_NOTE.get();
+            if (fault == null || fault.helpers.server != world.getServer() || !AgentCompanions.isAgent(entity)) return;
+            var record = fault.helpers.data.agents.get(entity.getStringUUID());
+            if (record == null || !record.owner().equals(fault.owner.toString()) || !record.name().equals("contested")) return;
+            if (!COMPETING_NOTE.compareAndSet(fault, null)) return;
+            fault.inserted.set(entity.getUUID());
+            try { Files.writeString(HelperPersistence.recoveryTemporary(fault.helpers.file), "competing evidence"); }
+            catch (IOException failure) { throw new IllegalStateException("Could not create test-only competing evidence", failure); }
+        });
         // Test-only observer: what the disk proves at the moment each new
         // native helper enters the world.
         ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> {
@@ -59,7 +84,8 @@ public class HelperBatchGameTests {
             if (observer == null || observer.helpers.server != world.getServer() || !AgentCompanions.isAgent(entity)
                 || !observer.helpers.data.agents.containsKey(entity.getStringUUID())) return;
             var disk = AgentCompanions.read(observer.helpers.file);
-            observer.seen.add(disk.agents.containsKey(entity.getStringUUID()) && disk.pendingCreations.contains(entity.getStringUUID()) ? "owned-and-pending" : "missing");
+            boolean owned = disk.agents.containsKey(entity.getStringUUID()) && disk.pendingCreations.contains(entity.getStringUUID());
+            observer.seen.add(owned && HelperPersistence.guardIntact(observer.helpers.file) ? "owned-pending-guarded" : "missing-or-unguarded");
         });
     }
 
@@ -73,6 +99,7 @@ public class HelperBatchGameTests {
         private final Map<String, Fault> armed = new HashMap<>();
         private String last = "";
         boolean noDirectorySync;
+        boolean blockMarkerWrites, blockRosterWrites, replaceGuardAfterRosterSync;
         private interface Step { void run() throws IOException; }
         void arm(String step, boolean afterEffect) { armLater(step, afterEffect, 0); }
         /** Fails the step's occurrence after {@code skip} successful ones. */
@@ -89,13 +116,24 @@ public class HelperBatchGameTests {
             if (after != null) throw new IOException("Injected failure after " + name);
         }
         @Override public void copy(Path from, Path to) throws IOException { step("copy:" + to.getFileName(), false, () -> HelperPersistence.NATIVE.copy(from, to)); }
-        @Override public void writeDurably(Path path, byte[] bytes) throws IOException { step("write:" + path.getFileName(), false, () -> HelperPersistence.NATIVE.writeDurably(path, bytes)); }
+        @Override public void writeDurably(Path path, byte[] bytes) throws IOException {
+            String name = path.getFileName().toString();
+            if ((blockMarkerWrites && name.equals("agents.json.recovery-required.tmp"))
+                || (blockRosterWrites && name.equals("agents.json.tmp"))) throw new IOException("Injected continuing write refusal");
+            step("write:" + name, false, () -> HelperPersistence.NATIVE.writeDurably(path, bytes));
+        }
         @Override public void atomicMove(Path from, Path to) throws IOException { step("move:" + to.getFileName(), false, () -> HelperPersistence.NATIVE.atomicMove(from, to)); }
         @Override public void delete(Path path) throws IOException { step("delete:" + path.getFileName(), false, () -> HelperPersistence.NATIVE.delete(path)); }
         @Override public void syncFile(Path path) throws IOException { step("fsync:" + path.getFileName(), true, () -> HelperPersistence.NATIVE.syncFile(path)); }
         @Override public void syncDirectory(Path directory) throws IOException {
             if (noDirectorySync) throw new IOException("Directory sync is unsupported on this storage");
+            String previous = last;
             step("sync-after:" + last, true, () -> HelperPersistence.NATIVE.syncDirectory(directory));
+            if (replaceGuardAfterRosterSync && previous.equals("move:agents.json")) {
+                replaceGuardAfterRosterSync = false;
+                Files.delete(directory.resolve("agents.json.recovery-required"));
+                Files.writeString(directory.resolve("agents.json.recovery-required.tmp"), "competing evidence");
+            }
         }
     }
     /** System chat text actually encoded for the player's native connection since the last drain. */
@@ -428,8 +466,8 @@ public class HelperBatchGameTests {
                 c.assertValueEqual(f.helpers.spawn(f.owner, "single"), 1, "The single-helper path still creates its helper");
                 c.assertValueEqual(f.helpers.spawnBatch(f.owner, 3, AgentCompanions.Profile.PRIMITIVE), 3, "The batch path still creates its full batch");
             } finally { INSERTION_OBSERVER.compareAndSet(observer, null); }
-            c.assertValueEqual(observer.seen, List.of("owned-and-pending", "owned-and-pending", "owned-and-pending", "owned-and-pending"),
-                "As each helper entered the world, its saved roster already owned it and retained its creation intent");
+            c.assertValueEqual(observer.seen, List.of("owned-pending-guarded", "owned-pending-guarded", "owned-pending-guarded", "owned-pending-guarded"),
+                "As each helper entered the world, its saved roster owned it and the creation guard was present");
             try (var files = Files.list(f.directory)) {
                 c.assertValueEqual(files.map(p -> p.getFileName().toString()).sorted().toList(), List.of("agents.json", "agents.json.previous"),
                     "Ordinary creation leaves no journal, marker or temporary file that could suggest recovery state");
@@ -577,10 +615,135 @@ public class HelperBatchGameTests {
             c.assertTrue(Arrays.equals(before, Files.readAllBytes(f.helpers.file)) && f.helpers.data.agents.equals(agents)
                 && f.helpers.data.pendingCreations.isEmpty() && f.helpers.loaded.isEmpty(),
                 "No roster, pending identity, existing unloaded helper, or world entity changed");
-            c.assertFalse(f.helpers.creationRecoveryRequired, "A proven pre-rename refusal permits retry after storage is fixed");
+            c.assertTrue(f.helpers.creationRecoveryRequired && Files.exists(HelperPersistence.recoveryTemporary(f.helpers.file))
+                && f.restart().creationRecoveryRequired, "The unfinished recovery note freezes now and on restart");
             io.noDirectorySync = false;
-            c.assertValueEqual(f.helpers.spawn(f.owner, "single"), 1, "The same name can be retried once durability is available");
+            f.helpers.spawn(f.owner, "single");
+            c.assertTrue(f.helpers.owned(f.owner, "single") == null && f.helpers.creationRecoveryRequired
+                && Files.exists(HelperPersistence.recoveryTemporary(f.helpers.file)),
+                "Repairing storage alone does not discard unfinished recovery evidence or create a helper");
         }
+        c.succeed();
+    }
+
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=180)
+    public void creationRefusesBeforeInsertingWhenRecoveryGuardCannotBeWritten(GameTestHelper c) throws Exception {
+        for (boolean batch : new boolean[]{false, true}) {
+            var io = new FaultyIo();
+            try (var f = new Fixture(c, io)) {
+                f.unloaded(f.owner.getUUID(), 1, "older-");
+                var before = Map.copyOf(f.helpers.data.agents); byte[] roster = Files.readAllBytes(f.helpers.file);
+                io.arm("write:agents.json.recovery-required.tmp", false);
+                int result = batch ? f.helpers.spawnBatch(f.owner, 2, AgentCompanions.Profile.REGULAR)
+                                   : f.helpers.spawn(f.owner, "guarded");
+                c.assertValueEqual(result, 0, "Creation refuses when its recovery guard cannot be prepared: " + batch);
+                c.assertTrue(f.helpers.data.agents.equals(before) && f.helpers.data.pendingCreations.isEmpty()
+                    && f.helpers.loaded.isEmpty() && Arrays.equals(roster, Files.readAllBytes(f.helpers.file)),
+                    "No existing or new ownership, pending identity, or native helper changes: " + batch);
+                c.assertTrue(Files.notExists(f.marker()) && !f.helpers.creationRecoveryRequired,
+                    "A failure before creating a note leaves no uncertainty: " + batch);
+                var restarted = f.restart();
+                c.assertTrue(!restarted.creationRecoveryRequired && restarted.data.agents.equals(before),
+                    "Restart sees the unchanged roster and its unloaded helper: " + batch);
+                int retry = batch ? f.helpers.spawnBatch(f.owner, 2, AgentCompanions.Profile.REGULAR)
+                                  : f.helpers.spawn(f.owner, "guarded");
+                c.assertValueEqual(retry, batch ? 2 : 1, "A clean pre-write failure permits a successful retry: " + batch);
+            }
+        }
+        c.succeed();
+    }
+
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=180)
+    public void partialCreationKeepsPreexistingGuardWhenLaterStorageWritesFail(GameTestHelper c) throws Exception {
+        var io = new FaultyIo();
+        try (var f = new Fixture(c, io)) {
+            f.unloaded(f.owner.getUUID(), 1, "older-"); var older = f.helpers.owned(f.owner, "older-1");
+            var inserted = new AtomicReference<UUID>();
+            c.assertTrue(GUARD_FAILURE.compareAndSet(null, new GuardFailure(f.helpers, f.owner.getUUID(), io, inserted)),
+                "The exact-owner insertion fault is armed once");
+            int result;
+            try { result = f.helpers.spawn(f.owner, "guarded"); }
+            finally { GUARD_FAILURE.set(null); }
+            c.assertTrue(result == 0 && inserted.get() != null && f.helpers.creationRecoveryRequired,
+                "The partial insertion is reported unresolved and freezes ownership");
+            c.assertTrue(Files.exists(f.marker()) && f.restart().creationRecoveryRequired,
+                "The guard established before insertion remains when all later marker and roster writes fail");
+            var saved = AgentCompanions.read(f.helpers.file);
+            c.assertTrue(saved.agents.containsKey(older.getKey()) && saved.agents.containsKey(inserted.get().toString())
+                && saved.pendingCreations.contains(inserted.get().toString()) && saved.dismissed.isEmpty(),
+                "The old unloaded helper and uncertain new identity remain in the durable roster");
+            var copy = f.saved(UUID.fromString(older.getKey())); f.restart().load(copy);
+            c.assertFalse(copy.isRemoved(), "A saved copy of the old unloaded helper is never retired");
+            copy.discard();
+        }
+        c.succeed();
+    }
+
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=180)
+    public void successfulInsertionWithUnretiredCreationGuardIsUnresolved(GameTestHelper c) throws Exception {
+        var io = new FaultyIo(); var wire = new NativePlayConnection(c.getLevel().registryAccess());
+        try (var f = new Fixture(c, io, wire)) {
+            io.arm("delete:agents.json.recovery-required", false); wire.drain();
+            c.assertValueEqual(f.helpers.spawn(f.owner, "guarded"), 0,
+                "Creation cannot report full success when its guard cannot be retired");
+            var record = f.helpers.owned(f.owner, "guarded");
+            c.assertTrue(record != null && f.helpers.unresolvedCreation(record.getKey()) && f.helpers.creationUnresolved
+                && f.helpers.creationRecoveryRequired && Files.exists(f.marker()) && f.restart().creationRecoveryRequired,
+                "The live and saved identity remains pending and the durable guard freezes restart");
+            var entity = f.helpers.loaded.get(UUID.fromString(record.getKey()));
+            c.assertTrue(entity != null && entity.isAlive() && !entity.isRemoved(), "The inserted helper is kept");
+            assertUnresolvedNotice(c, chat(wire), "guard retirement refused after successful insertion");
+        } finally { wire.channel.finishAndReleaseAll(); }
+        c.succeed();
+    }
+
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=180)
+    public void competingRecoveryNotePreventsGuardRetirementAfterInsertion(GameTestHelper c) throws Exception {
+        var wire = new NativePlayConnection(c.getLevel().registryAccess());
+        try (var f = new Fixture(c, HelperPersistence.NATIVE, wire)) {
+            var inserted = new AtomicReference<UUID>();
+            c.assertTrue(COMPETING_NOTE.compareAndSet(null, new CompetingNote(f.helpers, f.owner.getUUID(), inserted)),
+                "The exact-owner competing-note fixture is armed once");
+            wire.drain(); int result;
+            try { result = f.helpers.spawn(f.owner, "contested"); }
+            finally { COMPETING_NOTE.set(null); }
+            var record = f.helpers.owned(f.owner, "contested");
+            var temporary = HelperPersistence.recoveryTemporary(f.helpers.file);
+            c.assertTrue(result == 0 && inserted.get() != null && record != null && f.helpers.creationUnresolved
+                && f.helpers.creationRecoveryRequired && Files.exists(f.marker())
+                && Files.readString(temporary).equals("competing evidence"),
+                "The competing note prevents marker removal, freezes ownership and preserves both notes");
+            var restarted = f.restart();
+            c.assertTrue(restarted.creationRecoveryRequired && restarted.unresolvedCreation(record.getKey()),
+                "Restart retains the pending identity and remains frozen");
+            var entity = f.helpers.loaded.get(inserted.get());
+            c.assertTrue(entity != null && entity.isAlive() && !entity.isRemoved(), "The inserted body is retained");
+            assertUnresolvedNotice(c, chat(wire), "competing recovery note");
+        } finally { wire.channel.finishAndReleaseAll(); }
+        c.succeed();
+    }
+
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=180)
+    public void creationKeepsPendingIdentityWhenGuardDeletionAndFollowupNoteFail(GameTestHelper c) throws Exception {
+        var io = new FaultyIo(); var wire = new NativePlayConnection(c.getLevel().registryAccess());
+        try (var f = new Fixture(c, io, wire)) {
+            f.unloaded(f.owner.getUUID(), 1, "older-"); var older = f.helpers.owned(f.owner, "older-1");
+            io.arm("sync-after:delete:agents.json.recovery-required", true);
+            io.armLater("write:agents.json.recovery-required.tmp", false, 1); wire.drain();
+            c.assertValueEqual(f.helpers.spawn(f.owner, "guarded"), 0,
+                "An unproven guard retirement reports creation as unresolved");
+            var record = f.helpers.owned(f.owner, "guarded");
+            c.assertTrue(record != null && f.helpers.creationUnresolved && f.helpers.creationRecoveryRequired
+                && Files.notExists(f.marker()) && Files.notExists(HelperPersistence.recoveryTemporary(f.helpers.file)),
+                "This runtime freezes even when neither recovery note survives");
+            assertUnresolvedNotice(c, chat(wire), "guard deletion and followup note failed");
+            var restarted = f.restart();
+            c.assertTrue(!restarted.creationRecoveryRequired && restarted.unresolvedCreation(record.getKey())
+                && restarted.data.agents.containsKey(older.getKey()),
+                "Known limit: restart need not freeze without a note, but both the uncertain and older identities remain reserved");
+            var copy = f.saved(UUID.fromString(older.getKey())); restarted.load(copy);
+            c.assertFalse(copy.isRemoved(), "The older unloaded helper is retained"); copy.discard();
+        } finally { wire.channel.finishAndReleaseAll(); }
         c.succeed();
     }
 
@@ -1545,8 +1708,10 @@ public class HelperBatchGameTests {
 
     @GameTest(structure="convergence_tests:combat_arena", maxTicks=240)
     public void bedrockCreateNeverAsksForBetterGroundAfterAStorageOrFrozenOwnershipFailure(GameTestHelper c) throws Exception {
-        // Untouched storage failure, then an ambiguous initial roster save that freezes ownership.
-        for (var fault : List.of(Map.entry("write:agents.json.tmp", false), Map.entry("sync-after:move:agents.json", true))) {
+        // Untouched and interrupted guard writes, then untouched and ambiguous roster saves.
+        for (var fault : List.of(Map.entry("write:agents.json.recovery-required.tmp", false),
+                Map.entry("write:agents.json.recovery-required.tmp", true), Map.entry("write:agents.json.tmp", false),
+                Map.entry("sync-after:move:agents.json", true))) {
             var io = new FaultyIo(); var wire = new NativePlayConnection(c.getLevel().registryAccess());
             try (var f = new Fixture(c, io, wire)) {
                 var touch = new Touch(); BedrockAgentMenu.open(f.owner, touch); touch.click("Create your first helper");
@@ -1572,6 +1737,24 @@ public class HelperBatchGameTests {
             wire.drain(); touch.click("Create: Regular");
             c.assertTrue(f.helpers.owned(f.owner, "helper-1") != null && chat(wire).stream().anyMatch(text -> text.contains("helper-1 appeared beside you • Regular")),
                 "Normal Bedrock creation still succeeds and says so");
+        } finally { wire.channel.finishAndReleaseAll(); }
+        c.succeed();
+    }
+
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=180)
+    public void bedrockCreationReportsFrozenGuardWhenPendingRosterExists(GameTestHelper c) throws Exception {
+        var io = new FaultyIo(); var wire = new NativePlayConnection(c.getLevel().registryAccess());
+        try (var f = new Fixture(c, io, wire)) {
+            var touch = new Touch(); BedrockAgentMenu.open(f.owner, touch); touch.click("Create your first helper");
+            io.replaceGuardAfterRosterSync = true; wire.drain(); touch.click("Create: Regular");
+            var entry = f.helpers.owned(f.owner, "helper-1"); var shown = touch.last().content(); var told = chat(wire);
+            c.assertTrue(entry != null && f.helpers.unresolvedCreation(entry.getKey()) && f.helpers.loaded.isEmpty()
+                && f.helpers.creationRecoveryRequired && f.restart().creationRecoveryRequired,
+                "A changed guard leaves pending ownership frozen before any native insertion");
+            c.assertTrue(shown.contains("No helper entity spawned") && shown.contains("frozen")
+                && !shown.contains("Move onto clear solid ground") && !shown.contains("appeared beside you")
+                && told.stream().noneMatch(text -> text.contains("appeared beside you")),
+                "The touch form reports frozen ownership rather than placement or success");
         } finally { wire.channel.finishAndReleaseAll(); }
         c.succeed();
     }
