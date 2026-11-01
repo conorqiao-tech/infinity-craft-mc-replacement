@@ -504,7 +504,7 @@ def main():
     for file in (ROOT / "compatibility/snapshot5").rglob("*"):
         if file.is_file():
             source[file.relative_to(ROOT).as_posix()] = file.read_bytes()
-    for name in ["tools/verify_snapshot5_integration.py", "tools/build_snapshot5_dependencies.py", "tools/snapshot5_dependencies.py", "tools/native_checks/Snapshot5ViaFixture.java",
+    for name in ["tools/verify_snapshot5_integration.py", "tools/typed_nbt.py", "tools/build_snapshot5_dependencies.py", "tools/snapshot5_dependencies.py", "tools/native_checks/Snapshot5ViaFixture.java",
         "tools/combined_wing_resources.py", "tools/check_winged_chest.py", "tools/creative-bridge-proof/WingedChestProof.java",
         "java/build.gradle", "java/settings.gradle", "java/gradle.properties", "java/gradlew", "java/gradlew.bat",
         "TEXTURE_CREDITS.md", "TEXTURE_SHA256.json", "docs/CROSSPLAY_SOURCE.md", "tools/check_crossplay.py", "tools/prepare_crossplay.py", "tools/crossplay_resources.py", "tools/build_creative_bridge.py", "geyser-extension/extension.yml",

@@ -17,13 +17,14 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 
+import typed_nbt
 from prepare_crossplay import VERSION, expected_native_tests
 from snapshot5_dependencies import MINECRAFT, PROTOCOL, digest, snapshot_inputs, verify_lock
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC = Path("research/integration/snapshot5-integration.json")
 PRIVATE = Path("research/snapshot5-compatibility")
-SOURCE_FILES = ("tools/verify_snapshot5_integration.py", "tools/package_crossplay.py", "server/terrain_storage.py")
+SOURCE_FILES = ("tools/verify_snapshot5_integration.py", "tools/typed_nbt.py", "tools/package_crossplay.py", "server/terrain_storage.py")
 HELPER_POWER_MARKER = "infinity_helper_power_defaults"
 # Exact Snapshot5 IronGolem native bases and explore.51's five finite defaults.
 # This independent expectation is deliberately not imported from production code
@@ -437,6 +438,93 @@ def verify_saved_helper(original, converted, dimension, registrations, version=V
             "changed_attribute_ids": sorted(changed), "materialized_attribute_ids": sorted(materialized), "marker_added": migrated}
 
 
+def verify_saved_helper_tag_kinds(original, converted, migration):
+    """Verify native kinds and stable bytes for the same decoded helper comparison.
+
+    Position and motion values retain their existing separate allowance, but
+    their native kinds and shapes must match. Existing attributes may reorder;
+    only the exact defaults migration already derived by verify_saved_helper
+    may change a base value or add a double-valued attribute or int marker.
+    """
+    require(isinstance(original, typed_nbt.Tag) and original.kind == 10
+            and isinstance(converted, typed_nbt.Tag) and converted.kind == 10,
+            "invalid typed saved helper")
+    before, after = original.payload, converted.payload
+    for entity in (before, after):
+        identity = entity.get(b"UUID")
+        require(isinstance(identity, typed_nbt.Tag) and identity.kind == 11 and len(identity.payload) == 16,
+                "saved helper UUID is not a native int array")
+
+    ignored = {b"attributes", b"InfinityAdminStats", b"Pos", b"Motion"}
+    old_stable = {key: value for key, value in before.items() if key not in ignored}
+    new_stable = {key: value for key, value in after.items() if key not in ignored}
+    require(old_stable.keys() == new_stable.keys()
+            and all(typed_nbt.same(value, new_stable[key]) for key, value in old_stable.items()),
+            "saved helper stable field bytes or native tag kinds changed")
+
+    for key in (b"Pos", b"Motion"):
+        require((key in before) == (key in after), "saved helper movement field presence changed")
+        if key in before:
+            require(typed_nbt.same_shape(before[key], after[key]), "saved helper movement field tag kinds changed")
+
+    def attributes(entity):
+        group = entity.get(b"attributes")
+        require(isinstance(group, typed_nbt.Tag) and group.kind == 9, "invalid typed helper attributes")
+        child_kind, rows = group.payload
+        require(child_kind == 10 or (not rows and child_kind == 0), "invalid typed helper attribute list")
+        result = {}
+        for row in rows:
+            require(row.kind == 10, "invalid typed helper attribute")
+            name = row.payload.get(b"id")
+            require(isinstance(name, typed_nbt.Tag) and name.kind == 8, "invalid typed helper attribute identity")
+            name = name.payload.decode("utf-8", "surrogateescape")
+            require(name not in result, "duplicate typed helper attribute")
+            result[name] = row
+        return child_kind, result
+
+    old_kind, old_rows = attributes(before)
+    new_kind, new_rows = attributes(after)
+    changed = set(migration["changed_attribute_ids"])
+    materialized = set(migration["materialized_attribute_ids"])
+    require(set(new_rows) - set(old_rows) == materialized and not (set(old_rows) - set(new_rows)),
+            "typed helper attribute inventory changed unexpectedly")
+    if old_kind != new_kind:
+        require(not old_rows and old_kind == 0 and new_kind == 10 and set(new_rows) == materialized,
+                "typed helper attribute list kind changed")
+    for name, old in old_rows.items():
+        new = new_rows[name]
+        if name not in changed:
+            require(typed_nbt.same(old, new), "saved helper attribute bytes or native tag kinds changed")
+            continue
+        require(old.payload.keys() == new.payload.keys(), "migrated helper attribute fields changed")
+        old_base, new_base = old.payload.get(b"base"), new.payload.get(b"base")
+        require(isinstance(old_base, typed_nbt.Tag) and old_base.kind == 6
+                and isinstance(new_base, typed_nbt.Tag) and new_base.kind == 6,
+                "migrated helper attribute must retain native double type")
+        require(all(typed_nbt.same(value, new.payload[key]) for key, value in old.payload.items() if key != b"base"),
+                "migrated helper attribute metadata changed")
+    for name in materialized:
+        row = new_rows[name]
+        require(set(row.payload) == {b"id", b"base"} and row.payload[b"id"].kind == 8
+                and row.payload[b"base"].kind == 6, "materialized helper attribute has unexpected native types")
+
+    old_meta, new_meta = before.get(b"InfinityAdminStats"), after.get(b"InfinityAdminStats")
+    if not migration["migration_applied"]:
+        require((old_meta is None and new_meta is None) or typed_nbt.same(old_meta, new_meta),
+                "saved helper stat history bytes or native tag kinds changed")
+    else:
+        require((old_meta is None or old_meta.kind == 10) and isinstance(new_meta, typed_nbt.Tag) and new_meta.kind == 10,
+                "invalid typed helper stat history")
+        marker = new_meta.payload.get(HELPER_POWER_MARKER.encode())
+        require(isinstance(marker, typed_nbt.Tag) and marker.kind == 3 and marker.payload == struct.pack(">i", 1),
+                "helper migration marker has unexpected native type or value")
+        old_records = {} if old_meta is None else old_meta.payload
+        new_records = {key: value for key, value in new_meta.payload.items() if key != HELPER_POWER_MARKER.encode()}
+        require(old_records.keys() == new_records.keys()
+                and all(typed_nbt.same(value, new_records[key]) for key, value in old_records.items()),
+                "saved helper stat history changed during migration")
+
+
 def native_world(root, base, label, evidence):
     """Recheck copied save bytes, JSON and helper semantics without exporting them."""
     sys.path.insert(0, str(root / "server"))
@@ -518,25 +606,40 @@ def native_world(root, base, label, evidence):
         found = {}
         for file in world.rglob("entities/r.*.mca"):
             for record in storage.region_records(file):
-                nbt = storage.NBT(storage.unpack(record[4], record[5])).parse()
-                for entity in nbt.get("Entities", []):
-                    # Actual traversal of every top-level entity in both worlds;
-                    # no receipt boolean can stand in for this check.
+                raw = storage.unpack(record[4], record[5])
+                nbt = storage.NBT(raw).parse()
+                values = nbt.get("Entities") if isinstance(nbt, dict) else None
+                require(isinstance(values, list), "invalid native entity list")
+                entries = []
+                for entity in values:
                     key, tags = verify_top_level_entity(entity, wanted, reserved)
                     require("infinity_agent" not in tags or key in wanted,
                             "unregistered tagged helper in copied world")
+                    entries.append((key, entity))
+                typed = typed_nbt.parse(raw)
+                require(same_native_value(nbt, typed_nbt.plain(typed)), "native NBT readers disagree")
+                group = typed.payload.get(b"Entities") if typed.kind == 10 else None
+                require(isinstance(group, typed_nbt.Tag) and group.kind == 9, "invalid native entity list")
+                child_kind, typed_values = group.payload
+                require(len(entries) == len(typed_values)
+                        and (child_kind == 10 or (not typed_values and child_kind == 0)),
+                        "invalid native entity list type")
+                for (key, entity), typed_entity in zip(entries, typed_values):
                     if key in wanted:
                         require(key not in found, "duplicate helper UUID in copied world")
-                        found[key] = (entity, native_entity_dimension(file.relative_to(world)))
+                        found[key] = (entity, native_entity_dimension(file.relative_to(world)), typed_entity)
         require(set(found) == wanted, "saved helper missing from copied entity regions")
         return found
     old_entities, new_entities = entities(before), entities(after)
     migration_observations = []
     for key in wanted:
-        original, old_dimension = old_entities[key]; converted, new_dimension = new_entities[key]
+        original, old_dimension, original_typed = old_entities[key]
+        converted, new_dimension, converted_typed = new_entities[key]
         require(old_dimension == new_dimension, "copied helper changed native levels")
         require(native_helper_uuid(original) == key, "saved helper native UUID differs from registration")
-        migration_observations.append(verify_saved_helper(original, converted, old_dimension, registrations))
+        observation = verify_saved_helper(original, converted, old_dimension, registrations)
+        verify_saved_helper_tag_kinds(original_typed, converted_typed, observation)
+        migration_observations.append(observation)
     for name in ("snapshot5-world-conversion-lab/conversion-result.json", "snapshot5-world-conversion-lab/world-copy-manifest.json", "world-semantics-comparison.json"):
         evidence["world_" + Path(name).stem] = digest(base / name)
     evidence["world_conversion_log"] = digest(private_path(root, result["log"]))
@@ -544,7 +647,8 @@ def native_world(root, base, label, evidence):
     return {"source_data_version": old_level["DataVersion"], "target_data_version": 5125,
             "input_files": len(originals), "offline_player_files": len(players), "mod_state_files": len(mods),
             "helpers": len(wanted), "offline_player_bytes_preserved": True, "mod_state_preserved": True,
-            "helper_decoded_fields_preserved": True, "helper_native_nbt_tag_kinds_verified": False,
+            "helper_decoded_fields_preserved": True, "helper_native_nbt_tag_kinds_verified": True,
+            "helper_tag_kind_scope": "registered helper fields; movement values have separate allowances, tag shapes and authorized defaults migration checked",
             "difficulty_preserved": True,
             "original_copy_unchanged": True, "no_player_logins": True, "terrain_refreshed": False,
             "helper_default_migration": {
@@ -635,7 +739,7 @@ def collect(root=ROOT):
         "bridge_integration": digest(base / "upstream-bridge/integration-proof.json"), "translated_play": digest(positive_path),
         "app_run": digest(base / "snapshot5-crossplay-lab/final-app-run.json"), "ack_result": digest(base / "viafabric-ack-runtime/result-final.json"), "ack_report": digest(ack_xml)})
     world = native_world(root, base, mods, evidence)
-    return {"format_version": 2, "version": VERSION, "minecraft": MINECRAFT, "protocol": PROTOCOL, "experimental": True,
+    return {"format_version": 3, "version": VERSION, "minecraft": MINECRAFT, "protocol": PROTOCOL, "experimental": True,
             "snapshot5_inputs": inputs, "source_hashes": {name: digest(root / name) for name in SOURCE_FILES},
             "dependency_lock_sha256": digest(root / "server/dependencies.lock.json"), "runtime_mod_sha256": mods,
             "native_tests": len(native_names), "codec_tests": len(names),

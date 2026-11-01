@@ -556,8 +556,15 @@ class NativeWorldPassengerTests(unittest.TestCase):
 
     def run_world(self, before_entities, after_entities):
         stub = self.storage_stub(before_entities, after_entities)
+        # This legacy fixture stubs region decoding. Supply synthetic encoded NBT
+        # to the real typed reader; separate integration tests use real region bytes.
+        parse = gate.typed_nbt.parse
+        def typed_fixture(label):
+            values = before_entities if label == "before" else after_entities
+            return parse(b"\x0a" + nbt_text("") + nbt_body({"Entities": values}))
         with mock.patch.dict(sys.modules, {"terrain_storage": stub}), \
                 mock.patch.object(sys, "path", list(sys.path)), \
+                mock.patch.object(gate.typed_nbt, "parse", side_effect=typed_fixture), \
                 mock.patch.object(gate, "verify_nested_passengers", wraps=gate.verify_nested_passengers) as traversal:
             summary = gate.native_world(self.root, self.base, self.label, {})
         return summary, traversal
@@ -583,7 +590,7 @@ class NativeWorldPassengerTests(unittest.TestCase):
         summary, traversal = self.run_world(before, after)
         self.assertEqual(summary["helpers"], 1)
         self.assertTrue(summary["helper_decoded_fields_preserved"])
-        self.assertFalse(summary["helper_native_nbt_tag_kinds_verified"])
+        self.assertTrue(summary["helper_native_nbt_tag_kinds_verified"])
         self.assertNotIn("helper_stable_fields_preserved", summary)
         self.assertEqual(self.parsed, ["before", "after"])
         inspected = [call.args[0] for call in traversal.call_args_list]
@@ -1048,6 +1055,103 @@ class NativeWorldPassengerTests(unittest.TestCase):
                 self.prepare()
                 self.assert_rejected(self.world(), self.world(), "removal provenance")
         del self.registration["dismissed"]
+
+
+class NativeWorldTagKindIntegrationTests(unittest.TestCase):
+    """Exercise native_world with two real NBT parsers on generated region payloads.
+
+    The surrounding region and level metadata are synthetic; no real player or
+    world is involved. The NBT bytes themselves go through both real parsers.
+    """
+    def setUp(self):
+        self.fixture = NativeWorldPassengerTests("test_player_root_vehicle_absent_passes_and_both_worlds_are_decoded")
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+
+    @staticmethod
+    def encode(entity):
+        return b"\x0a" + nbt_text("") + nbt_body({"Entities": [entity]})
+
+    @staticmethod
+    def replace_one(data, before, after):
+        if data.count(before) != 1:
+            raise AssertionError("synthetic field was not unique")
+        return data.replace(before, after, 1)
+
+    def run_raw(self, before, after):
+        fixture = self.fixture
+        stub = fixture.storage_stub([], [])
+        stub.NBT = real_storage.NBT
+        stub.unpack = lambda label, compression: {"before": before, "after": after}[label]
+        with mock.patch.dict(sys.modules, {"terrain_storage": stub}), mock.patch.object(sys, "path", list(sys.path)):
+            return gate.native_world(fixture.root, fixture.base, fixture.label, {})
+
+    def test_identical_native_kinds_pass_through_the_real_gate(self):
+        raw = self.encode(self.fixture.helper)
+        summary = self.run_raw(raw, raw)
+        self.assertTrue(summary["helper_native_nbt_tag_kinds_verified"])
+        self.assertIn("movement values", summary["helper_tag_kind_scope"])
+
+    def test_equal_decoded_values_with_different_types_fail_both_copies(self):
+        helper = copy.deepcopy(self.fixture.helper)
+        helper["synthetic_empty"] = []
+        raw = self.encode(helper)
+        uuid_bytes = b"".join(struct.pack(">i", value) for value in helper["UUID"])
+        cases = {
+            "numeric kind": (b"\x03" + nbt_text("PlayerCreated") + struct.pack(">i", 1),
+                             b"\x01" + nbt_text("PlayerCreated") + b"\x01"),
+            "float kind": (b"\x06" + nbt_text("Health") + struct.pack(">d", 73.0),
+                           b"\x05" + nbt_text("Health") + struct.pack(">f", 73.0)),
+            "uuid array versus list": (b"\x0b" + nbt_text("UUID") + struct.pack(">i", 4) + uuid_bytes,
+                                      b"\x09" + nbt_text("UUID") + b"\x03" + struct.pack(">i", 4) + uuid_bytes),
+            "nested equipment type": (b"\x03" + nbt_text("count") + struct.pack(">i", 1),
+                                      b"\x01" + nbt_text("count") + b"\x01"),
+            "saved stat history type": (b"\x03" + nbt_text("expanded") + struct.pack(">i", 1),
+                                        b"\x01" + nbt_text("expanded") + b"\x01"),
+            "empty list element type": (b"\x09" + nbt_text("synthetic_empty") + b"\x00" + struct.pack(">i", 0),
+                                       b"\x09" + nbt_text("synthetic_empty") + b"\x08" + struct.pack(">i", 0)),
+            "position element type": (b"\x09" + nbt_text("Pos") + b"\x06" + struct.pack(">i3d", 3, *helper["Pos"]),
+                                     b"\x09" + nbt_text("Pos") + b"\x05" + struct.pack(">i3f", 3, *helper["Pos"])),
+            "motion element type": (b"\x09" + nbt_text("Motion") + b"\x06" + struct.pack(">i3d", 3, *helper["Motion"]),
+                                   b"\x09" + nbt_text("Motion") + b"\x05" + struct.pack(">i3f", 3, *helper["Motion"])),
+        }
+        for name, (before, after) in cases.items():
+            changed = self.replace_one(raw, before, after)
+            self.assertEqual(real_storage.NBT(raw).parse(), real_storage.NBT(changed).parse())
+            for first, second in ((raw, changed), (changed, raw)):
+                with self.subTest(case=name, altered="before" if first == changed else "after"), self.assertRaises(ValueError):
+                    self.run_raw(first, second)
+
+    def test_expected_native_migration_and_attribute_reordering_pass(self):
+        source = HelperMigrationTests()
+        old, _ = source.fixture()
+        new = source.expected(old)
+        new["attributes"].reverse()
+        new["Pos"][0] += 0.25
+        new["Motion"] = [0.0, -0.1, 0.0]
+        summary = self.run_raw(self.encode(old), self.encode(new))
+        self.assertTrue(summary["helper_native_nbt_tag_kinds_verified"])
+        self.assertEqual(summary["helper_default_migration"]["migrated_helpers"], 1)
+
+        # A marker with the same decoded value but a non-native byte tag fails.
+        raw = self.encode(new)
+        marker = nbt_text(gate.HELPER_POWER_MARKER)
+        changed = self.replace_one(raw, b"\x03" + marker + struct.pack(">i", 1), b"\x01" + marker + b"\x01")
+        with self.assertRaisesRegex(ValueError, "marker has unexpected native type"):
+            self.run_raw(self.encode(old), changed)
+        changed = self.replace_one(raw, b"\x06" + nbt_text("base") + struct.pack(">d", 1000.0),
+                                   b"\x05" + nbt_text("base") + struct.pack(">f", 1000.0))
+        with self.assertRaisesRegex(ValueError, "retain native double type"):
+            self.run_raw(self.encode(old), changed)
+
+    def test_authorized_materialized_double_attributes_pass(self):
+        old, _ = HelperMigrationTests().fixture()
+        old["attributes"] = []
+        new = copy.deepcopy(old)
+        new["attributes"] = [{"id": name, "base": value} for name, (_, value) in gate.HELPER_POWER_DEFAULTS.items()]
+        new["InfinityAdminStats"][gate.HELPER_POWER_MARKER] = 1
+        summary = self.run_raw(self.encode(old), self.encode(new))
+        self.assertEqual(summary["helper_default_migration"]["materialized_attributes"], 5)
 
 
 class OfflinePlayerVehicleTests(unittest.TestCase):
