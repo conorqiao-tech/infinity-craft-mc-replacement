@@ -12,6 +12,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import net.fabricmc.fabric.api.gametest.v1.GameTest;
@@ -383,17 +384,17 @@ public class HelperBatchGameTests {
             try { created = f.helpers.spawnBatch(f.owner, 3, AgentCompanions.Profile.PRIMITIVE); }
             finally { INSERTION_FAILURE.compareAndSet(fault, null); }
             c.assertTrue(created == 0 && inserted.get() != null,
-                "The real native entity callback failed after the ownership write, the real rollback writer then failed, and the call returned no success instead of throwing");
-            assertUnresolvedNotice(c, chat(wire), "batch, rollback write blocked");
-            c.assertTrue(f.helpers.creationRecoveryRequired && f.helpers.remaining(f.owner) == 0, "The double failure latches creation closed for the whole runtime");
+                "The native insertion callback failed after the ownership write, and the call returned no success instead of throwing");
+            assertUnresolvedNotice(c, chat(wire), "batch, later roster writes blocked");
+            c.assertTrue(f.helpers.creationRecoveryRequired && f.helpers.remaining(f.owner) == 0, "The uncertain insertion latches creation closed for the whole runtime");
             var staged = f.helpers.data.agents.keySet().stream().filter(id -> !before.containsKey(id)).toList();
             c.assertTrue(before.entrySet().stream().allMatch(e -> f.helpers.data.agents.get(e.getKey()) == e.getValue())
                 && staged.size() == 3 && staged.contains(inserted.get().toString()),
-                "A rollback whose removal is not proven keeps every staged record, as the creation save did, and every existing record object");
+                "The uncertain insertion keeps every staged record, as the creation save did, and every existing record object");
             c.assertTrue(f.helpers.loaded.get(entity.getUUID()) == entity && entity.getHealth() == 31, "The existing helper object and health are preserved");
             var partial = c.getLevel().getEntity(inserted.get());
             c.assertTrue(partial == null || (!partial.isRemoved() && f.helpers.loaded.get(inserted.get()) == partial),
-                "A new helper that reached the world is kept registered and paused, never deleted by the unproven rollback");
+                "A new helper that reached the world is kept registered and paused");
             c.assertTrue(Files.exists(f.marker()) && f.restart().creationRecoveryRequired, "The failure leaves a marker, so a restart stays frozen");
             var frozenAgents = Map.copyOf(f.helpers.data.agents); int frozenLoaded = f.helpers.loaded.size();
             Path previous = f.helpers.file.resolveSibling(f.helpers.file.getFileName()+".previous");
@@ -1344,7 +1345,43 @@ public class HelperBatchGameTests {
     }
 
     @GameTest(structure="convergence_tests:combat_arena", maxTicks=240)
-    public void insertionRollbackDeletesOnlyAfterAProvenGuardedRemovalAndKeepsHelpersOtherwise(GameTestHelper c) throws Exception {
+    public void failedCreationKeepsAnUnseenBodyWithTheSameIdentity(GameTestHelper c) throws Exception {
+        try (var f = new Fixture(c)) {
+            f.unloaded(f.owner.getUUID(), 1, "older-");
+            var older = f.helpers.owned(f.owner, "older-1");
+            var inserted = new AtomicReference<UUID>();
+            var fault = new InsertionFailure(f.helpers, f.owner.getUUID(), f.directory.resolve("unrelated-fault"), inserted);
+            c.assertTrue(INSERTION_FAILURE.compareAndSet(null, fault), "The private exact-owner insertion failure is armed");
+            try { c.assertValueEqual(f.helpers.spawnBatch(f.owner, 2, AgentCompanions.Profile.REGULAR), 0, "Incomplete insertion is not success"); }
+            finally { INSERTION_FAILURE.compareAndSet(fault, null); }
+            c.assertTrue(inserted.get() != null, "The native insertion callback supplied the staged identity");
+            // Model a tagged body encountered after restart with that identity.
+            // This object is a synthetic collision, not a saved real-world body.
+            var unseen = f.saved(inserted.get());
+            unseen.setHealth(37); unseen.getAttribute(Attributes.MOVEMENT_SPEED).setBaseValue(.31);
+            unseen.setCustomName(Component.literal("Existing helper name"));
+            unseen.addTag("infinity_owner_" + UUID.randomUUID());
+            var originalTags = Set.copyOf(unseen.entityTags());
+            var originalStats = ((AdminStatEntity) unseen).infinity$adminStats().copy();
+            var restarted = f.restart(); restarted.load(unseen);
+            c.assertFalse(unseen.isRemoved(), "Failure to create a new helper is not proof that a later same-UUID body is disposable");
+            c.assertTrue(unseen.getHealth() == 37 && unseen.getAttribute(Attributes.MOVEMENT_SPEED).getBaseValue() == .31,
+                "The unseen body's edited health and speed survive");
+            c.assertTrue(originalTags.equals(unseen.entityTags()) && unseen.getCustomName().getString().equals("Existing helper name"),
+                "Frozen ownership does not rewrite the unseen body's name or ownership tags");
+            c.assertValueEqual(((AdminStatEntity) unseen).infinity$adminStats(), originalStats, "Frozen ownership does not migrate saved stat metadata");
+            var disk = AgentCompanions.read(f.helpers.file);
+            c.assertTrue(disk.agents.containsKey(older.getKey()) && disk.agents.containsKey(inserted.get().toString())
+                    && disk.pendingCreations.contains(inserted.get().toString()) && !disk.guardedRemovals.contains(inserted.get().toString()),
+                "The old record and uncertain staged identity stay reserved without new removal proof");
+            c.assertTrue(restarted.creationRecoveryRequired && Files.exists(f.marker()), "The restart stays frozen for review");
+            unseen.discard();
+        }
+        c.succeed();
+    }
+
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=240)
+    public void failedInsertionKeepsPendingIdentitiesAndRecoveryEvidence(GameTestHelper c) throws Exception {
         try (var f = new Fixture(c)) {
             f.helpers.spawn(f.owner, "kept"); var before = Map.copyOf(f.helpers.data.agents);
             var inserted = new AtomicReference<UUID>();
@@ -1354,11 +1391,17 @@ public class HelperBatchGameTests {
             try { created = f.helpers.spawnBatch(f.owner, 3, AgentCompanions.Profile.REGULAR); }
             finally { INSERTION_FAILURE.compareAndSet(fault, null); }
             c.assertValueEqual(created, 0, "A refused insertion reports no success");
-            c.assertTrue(f.helpers.data.agents.equals(before) && !f.helpers.creationRecoveryRequired && Files.notExists(f.marker()),
-                "A proven guarded rollback restores the roster, retires its marker and stays writable");
-            c.assertTrue(inserted.get() != null && c.getLevel().getEntity(inserted.get()) == null, "Only after the proven rollback is the new helper removed");
+            var saved = AgentCompanions.read(f.helpers.file);
+            c.assertTrue(inserted.get() != null && saved.agents.keySet().containsAll(before.keySet())
+                    && saved.agents.size() == before.size() + 3 && saved.pendingCreations.contains(inserted.get().toString())
+                    && !saved.guardedRemovals.contains(inserted.get().toString()),
+                "The prior identities and the uncertain staged identities stay reserved without removal proof");
+            c.assertTrue(f.helpers.creationRecoveryRequired && Files.exists(f.marker()) && f.restart().creationRecoveryRequired,
+                "The existing guard freezes the runtime and restart for host review");
+            var partial = c.getLevel().getEntity(inserted.get());
+            c.assertTrue(partial == null || !partial.isRemoved(), "Any partially inserted native body is kept");
             var copy = f.saved(inserted.get()); f.restart().load(copy);
-            c.assertTrue(copy.isRemoved(), "Its durable removal proof retires a stale copy after restart");
+            c.assertFalse(copy.isRemoved(), "A later same-UUID body is not automatically discarded"); copy.discard();
         }
         var wire = new NativePlayConnection(c.getLevel().registryAccess());
         try (var f = new Fixture(c, HelperPersistence.NATIVE, wire)) {
@@ -1372,7 +1415,7 @@ public class HelperBatchGameTests {
             try { created = f.helpers.spawnBatch(f.owner, 3, AgentCompanions.Profile.REGULAR); }
             finally { INSERTION_FAILURE.compareAndSet(fault, null); }
             c.assertTrue(created == 0 && f.helpers.creationRecoveryRequired,
-                "Without a marker the rollback is not attempted; the call returns no success without throwing and this runtime freezes");
+                "A competing temporary note also leaves the incomplete creation frozen without throwing");
             assertUnresolvedNotice(c, chat(wire), "batch, marker refused");
             var saved = AgentCompanions.read(f.helpers.file);
             c.assertTrue(saved.agents.keySet().containsAll(before.keySet()) && saved.agents.size() == before.size() + 3 && saved.dismissed.isEmpty(),
@@ -1395,7 +1438,7 @@ public class HelperBatchGameTests {
             var wire = new NativePlayConnection(c.getLevel().registryAccess());
             try (var f = new Fixture(c, HelperPersistence.NATIVE, wire)) {
                 f.unloaded(f.owner.getUUID(), 1, "older-"); var older = f.helpers.owned(f.owner, "older-1");
-                // The creation save copies this roster to .previous; the rollback must not replace that copy.
+                // The creation save copies this roster to .previous; the failure must not replace that copy.
                 byte[] preCreation = Files.readAllBytes(f.helpers.file);
                 var touch = new Touch();
                 if (path.equals("bedrock form")) { BedrockAgentMenu.open(f.owner, touch); touch.click("Create another helper"); }
@@ -1436,7 +1479,7 @@ public class HelperBatchGameTests {
                 Files.delete(blocked.resolve("block-rollback")); Files.delete(blocked);
             } finally { wire.channel.finishAndReleaseAll(); }
         }
-        // A proven rollback whose marker cannot be retired: helpers are kept inert and shielded, not discarded.
+        // A failed insertion never tries to retire the guard or delete a body.
         var io = new FaultyIo(); var wire = new NativePlayConnection(c.getLevel().registryAccess());
         try (var f = new Fixture(c, io, wire)) {
             var inserted = new AtomicReference<UUID>();
@@ -1447,15 +1490,17 @@ public class HelperBatchGameTests {
             wire.drain();
             try { created = f.helpers.spawnBatch(f.owner, 2, AgentCompanions.Profile.REGULAR); }
             finally { INSERTION_FAILURE.compareAndSet(fault, null); }
-            c.assertValueEqual(created, 0, "A stuck marker after a proven rollback still reports no success, without throwing");
-            assertUnresolvedNotice(c, chat(wire), "batch, marker retirement refused");
-            c.assertTrue(f.helpers.creationUnresolved && f.helpers.creationRecoveryRequired && Files.exists(f.marker()),
-                "The outcome is unresolved even though memory no longer lists the helpers, and the kept marker freezes ownership");
+            c.assertValueEqual(created, 0, "An incomplete insertion reports no success, without throwing");
+            assertUnresolvedNotice(c, chat(wire), "batch, guard kept after insertion failure");
+            c.assertTrue(f.helpers.creationUnresolved && f.helpers.creationRecoveryRequired && Files.exists(f.marker())
+                    && io.armed.containsKey("delete:agents.json.recovery-required")
+                    && f.helpers.data.pendingCreations.contains(inserted.get().toString()),
+                "The guard is not retired and the pending identity remains reserved");
             var partial = c.getLevel().getEntity(inserted.get());
             try {
-                c.assertTrue(partial == null || (!partial.isRemoved() && !f.helpers.loaded.containsKey(inserted.get())
+                c.assertTrue(partial == null || (!partial.isRemoved() && f.helpers.loaded.get(inserted.get()) == partial
                     && AgentCompanions.retainedHelperShielded((IronGolem) partial, ((IronGolem) partial).damageSources().playerAttack(f.owner))),
-                    "A helper that reached the world is unregistered, kept inert and shielded rather than discarded");
+                    "A helper that reached the world is kept, paused and shielded rather than discarded");
             } finally { if (partial != null) partial.discard(); }
         } finally { wire.channel.finishAndReleaseAll(); }
         c.succeed();
