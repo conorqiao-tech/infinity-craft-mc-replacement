@@ -31,7 +31,7 @@ final class AgentMenu {
     static final int BATCH_CREATE = 7;
     static final int GPT_PLAN = 25;
     static final String ASK_QUESTION = "Explain my helper's current state and suggest what I should do next.";
-    static final String DISMISS_WARNING = "Dismiss removes this helper's identity. Any saved copy, even one you cannot see, may be deleted with its edited stats. Choose Keep to cancel.";
+    static final String DISMISS_WARNING = "Dismiss removes this helper's identity. A saved copy, even one you cannot see, may be deleted with its edited stats this session. Copies first loaded after restart are kept for host review. Choose Keep to cancel.";
     enum Page { ROSTER, HELPER, DISMISS }
 
     private AgentMenu() {}

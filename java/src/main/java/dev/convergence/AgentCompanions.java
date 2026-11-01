@@ -69,7 +69,7 @@ public final class AgentCompanions {
     boolean rosterEstablished;
     /** Set once a creation in this runtime ended UNRESOLVED; its helpers may be in the world whatever memory lists. */
     boolean creationUnresolved;
-    /** Removal proofs known to be durable on disk; only these may authorize deleting a saved entity. */
+    /** Explicit guarded dismissals completed in this runtime; historical format-3 entries are ambiguous. */
     Set<String> provenRemoved = new HashSet<>();
     static final int DISMISSED_LIMIT = 256;
     static final String FROZEN = "Helper ownership is frozen for host review. Ask the host to preserve the roster, its .previous copy and any .recovery-required or temporary note.";
@@ -191,9 +191,9 @@ public final class AgentCompanions {
         else if (creationRecoveryRequired)
             org.slf4j.LoggerFactory.getLogger("Infinity helpers").error("Helper ownership is frozen by recovery evidence beside {}. Preserve the roster, its .previous copy, {} and {}; investigate the matching whole-world data or restore a verified matching whole-world backup before any recovery.",
                 file, HelperPersistence.recoveryMarker(file), HelperPersistence.recoveryTemporary(file));
-        // Removal proofs read at startup count only once the roster as read is
-        // itself synced; otherwise stale copies are kept inert, never deleted.
-        else if (persistence.proveExisting(file)) provenRemoved = new HashSet<>(data.guardedRemovals);
+        // Format 3 used guardedRemovals for both explicit dismissals and
+        // failed-creation rollbacks. Preserve them, but do not infer which
+        // historical entries authorize disposal of an unseen saved body.
     }
     static AgentCompanions get(MinecraftServer server) {
         return INSTANCES.computeIfAbsent(server, s -> new AgentCompanions(s, s.getWorldPath(LevelResource.ROOT).resolve("infinity-agents.json")));
@@ -356,9 +356,10 @@ public final class AgentCompanions {
         try {
             var durability = persistence.replace(file, rosterBytes(), keepPrevious, policy == Save.CREATION);
             rosterEstablished = true;
-            if (durability == HelperPersistence.Durability.PROVEN) { provenRemoved = new HashSet<>(data.guardedRemovals); return Commit.PROVEN; }
-            // Proofs present in both the earlier and the new roster stay proven.
+            // A saved legacy entry does not become explicit merely because it
+            // was written again. Keep only this runtime's still-present proofs.
             provenRemoved.retainAll(data.guardedRemovals);
+            if (durability == HelperPersistence.Durability.PROVEN) return Commit.PROVEN;
             if (policy == Save.ORDINARY) return Commit.UNPROVEN;
             restore(agents, dismissed, guarded, pending);
             freeze("a guarded removal was saved but could not be proven durable", null);
@@ -573,7 +574,7 @@ public final class AgentCompanions {
         }
         prepare(golem); tags(golem, agent); loaded.put(golem.getUUID(), golem);
     }
-    /** A tagged helper without a record is removed only with proven durable removal proof while not frozen. */
+    /** A tagged helper without a record is removed only after this runtime's explicit durable dismissal while not frozen. */
     void retireStale(IronGolem golem) {
         if (!creationRecoveryRequired && provenRemoved.contains(golem.getStringUUID())) { golem.discard(); return; }
         // Unknown, ambiguous or frozen: keep the saved entity for host
@@ -1052,11 +1053,12 @@ public final class AgentCompanions {
         // The dismissal is durable either way. Only delete the body once the
         // marker is retired; otherwise retireStale keeps it inert while frozen.
         boolean retired = unguard();
+        if (retired) provenRemoved.add(key);
         if (golem != null) { AgentAvatars.remove(golem); if (retired) golem.discard(); else retireStale(golem); }
         validatePlayerTargets();
         if (!retired) return reply(owner, name + " was dismissed and saved, but its recovery note could not be cleared"
             + (golem == null ? ". " : ", so its body was kept inert. ") + FROZEN);
-        return reply(owner, name + " dismissed." + (golem == null ? " Its saved entity will be removed when the area next loads." : ""));
+        return reply(owner, name + " dismissed." + (golem == null ? " A saved copy loaded this session may be removed; after a restart it is kept for host review." : ""));
     }
     /**
      * Native death already removed the exact registered body; this never throws

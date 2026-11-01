@@ -172,6 +172,7 @@ public class BedrockAgentMenuGameTests {
             BedrockAgentMenu.open(owner, forms); forms.click("kept •"); forms.click("Dismiss helper");
             c.assertTrue(forms.last().content().contains("saved copy") && forms.last().content().contains("cannot see")
                 && forms.last().content().contains("edited stats"), "Bedrock confirmation warns about unseen copies and edited stats");
+            c.assertTrue(forms.last().content().contains("after restart") && forms.last().content().contains("host review"), "Bedrock confirmation explains retention after restart");
             c.assertValueEqual(helpers.count(owner), 1, "Opening dismiss review does not remove the helper");
             forms.click("Keep this helper");
             c.assertTrue(helpers.data.agents.containsKey(oldId), "Cancel preserves the exact helper");
@@ -202,6 +203,7 @@ public class BedrockAgentMenuGameTests {
             c.assertValueEqual(forms.last().title(), "Dismiss kept?", "The review names the exact helper");
             c.assertTrue(forms.last().content().contains("saved copy") && forms.last().content().contains("cannot see")
                 && forms.last().content().contains("edited stats"), "The command review warns about unseen copies and edited stats");
+            c.assertTrue(forms.last().content().contains("after restart") && forms.last().content().contains("host review"), "Bedrock command review explains retention after restart");
             c.assertTrue(helpers.data.agents.containsKey(oldId) && !body.isRemoved() && body.getHealth() == 37, "Nothing is removed before Confirm");
             forms.click("Keep this helper");
             c.assertTrue(helpers.data.agents.containsKey(oldId) && !body.isRemoved() && forms.last().content().contains("Nothing was removed"),
