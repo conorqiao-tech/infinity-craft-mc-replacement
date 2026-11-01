@@ -836,12 +836,12 @@ public class HelperBatchGameTests {
                 c.assertTrue(restarted.creationRecoveryRequired && !restarted.provenRemoved.contains(id) && !later.isRemoved(),
                     "Restart stays frozen by the marker and keeps the saved copy without trusting the proof: " + label);
                 later.discard();
-                // Removing the marker is the host's explicit decision; the durable roster then decides alone.
+                // Removing the marker is the host's explicit decision. Even a
+                // durable format-3 entry does not prove why an old copy exists.
                 Files.delete(f.marker());
                 var resolved = f.restart(); var resolvedCopy = f.saved(UUID.fromString(id)); resolved.load(resolvedCopy);
-                c.assertValueEqual(resolved.provenRemoved.contains(id), renamed, "Only the verified on-disk version supplies a removal proof: " + label);
-                c.assertValueEqual(resolvedCopy.isRemoved(), renamed,
-                    "After the host clears the marker, a copy is retired only if the dismissal had durably reached disk: " + label);
+                c.assertFalse(resolved.provenRemoved.contains(id), "An old record is not current-session dismissal authority: " + label);
+                c.assertFalse(resolvedCopy.isRemoved(), "A saved copy is kept after restart regardless of which roster version survived: " + label);
                 resolvedCopy.discard();
             }
         }
@@ -1026,10 +1026,10 @@ public class HelperBatchGameTests {
             var staleNear = f.saved(UUID.fromString(near));
             var unknown = f.saved(UUID.randomUUID());
             restarted.load(staleAway); restarted.load(staleNear); restarted.load(unknown);
-            c.assertTrue(staleAway.isRemoved(), "After restart, a saved copy with durable dismissal proof is retired on load");
+            c.assertFalse(staleAway.isRemoved(), "After restart, an old guarded removal cannot distinguish dismissal from rollback; keep the copy");
             c.assertTrue(!staleNear.isRemoved() && restarted.loaded.get(staleNear.getUUID()) == staleNear,
                 "After restart, a saved copy of a helper that died naturally survives and keeps its record");
-            restarted.loaded.remove(staleNear.getUUID(), staleNear); staleNear.discard();
+            staleAway.discard(); restarted.loaded.remove(staleNear.getUUID(), staleNear); staleNear.discard();
             c.assertTrue(!unknown.isRemoved() && !restarted.loaded.containsKey(unknown.getUUID())
                 && ((AgentGoalAccess) unknown).infinity$getTargetSelector().getAvailableGoals().isEmpty(),
                 "An unknown tagged helper is kept, unregistered and without native targeting");
@@ -1087,6 +1087,32 @@ public class HelperBatchGameTests {
     }
 
     @GameTest(structure="convergence_tests:combat_arena", maxTicks=240)
+    public void legacyGuardedRemovalNeverDeletesAnUnseenBodyAfterRestart(GameTestHelper c) throws Exception {
+        try (var f = new Fixture(c)) {
+            f.unloaded(f.owner.getUUID(), 1, "older-");
+            var older = f.helpers.owned(f.owner, "older-1");
+            UUID ambiguous = UUID.randomUUID(); String id = ambiguous.toString();
+            // Format 3 used these same fields for both an old creation rollback
+            // and an explicit dismissal. Model a stored entry, not a real world.
+            f.helpers.data.dismissed.add(id); f.helpers.data.guardedRemovals.add(id); f.helpers.save();
+            var restarted = f.restart();
+            var body = f.saved(ambiguous); body.setHealth(37); body.getAttribute(Attributes.MOVEMENT_SPEED).setBaseValue(.31);
+            restarted.load(body);
+            c.assertFalse(body.isRemoved(), "An old guarded record alone cannot prove that the unseen body was dismissed");
+            c.assertTrue(body.getHealth() == 37 && body.getAttributeBaseValue(Attributes.MOVEMENT_SPEED) == .31,
+                "The synthetic body's edited health and movement are retained");
+            c.assertTrue(!restarted.provenRemoved.contains(id) && restarted.data.agents.containsKey(older.getKey())
+                    && restarted.data.dismissed.contains(id) && restarted.data.guardedRemovals.contains(id),
+                "The ambiguous record and earlier unloaded identity are preserved without new deletion authority");
+            restarted.save();
+            var later = f.saved(ambiguous); restarted.load(later);
+            c.assertFalse(later.isRemoved(), "An ordinary later roster save does not turn the ambiguous record into deletion authority");
+            body.discard(); later.discard();
+        }
+        c.succeed();
+    }
+
+    @GameTest(structure="convergence_tests:combat_arena", maxTicks=240)
     public void guardedRemovalProvenanceRoundTripsAndRejectsMalformedRecords(GameTestHelper c) throws Exception {
         try (var f = new Fixture(c)) {
             c.assertValueEqual(f.helpers.spawn(f.owner, "dismissed"), 1, "A new helper exists");
@@ -1095,8 +1121,12 @@ public class HelperBatchGameTests {
             var saved = AgentCompanions.read(f.helpers.file);
             c.assertTrue(saved.dismissed.contains(id) && saved.guardedRemovals.contains(id),
                 "The proven guarded removal records both its reserved identity and its provenance");
+            f.helpers.save();
+            c.assertTrue(f.helpers.provenRemoved.contains(id), "An ordinary save retains this runtime's explicit guarded dismissal");
+            var sameSession = f.saved(UUID.fromString(id)); f.helpers.load(sameSession);
+            c.assertTrue(sameSession.isRemoved(), "An explicitly dismissed copy can be retired in the same runtime");
             var restarted = f.restart(); var copy = f.saved(UUID.fromString(id)); restarted.load(copy);
-            c.assertTrue(restarted.provenRemoved.contains(id) && copy.isRemoved(), "The explicit guarded dismissal survives a fresh runtime");
+            c.assertTrue(!restarted.provenRemoved.contains(id) && !copy.isRemoved(), "After restart the historical format-3 entry is ambiguous and the body is kept"); copy.discard();
             var json = com.google.gson.JsonParser.parseString(CommunityServer.GSON.toJson(saved)).getAsJsonObject();
             Path invalid = f.directory.resolve("invalid-provenance.json");
             json.remove("guardedRemovals"); Files.writeString(invalid, json.toString());
@@ -1248,8 +1278,7 @@ public class HelperBatchGameTests {
                 c.assertFalse(live.isRemoved(), "A tick pass does not delete it: " + test.name);
                 var restarted = f.restart(); var copy = f.saved(UUID.fromString(id)); restarted.load(copy);
                 c.assertValueEqual(restarted.creationRecoveryRequired, test.frozenAfterRestart, "Restart is frozen exactly while a marker exists: " + test.name);
-                c.assertValueEqual(copy.isRemoved(), !test.frozenAfterRestart,
-                    "A copy is retired only when unfrozen, and then only by the proven dismissal the player was told about: " + test.name);
+                c.assertFalse(copy.isRemoved(), "After restart the copy is kept even if a failed note leaves ownership unfrozen: " + test.name);
                 copy.discard(); live.discard();
             }
         }
@@ -1338,8 +1367,10 @@ public class HelperBatchGameTests {
             c.assertValueEqual(f.helpers.dismiss(f.owner, "veteran-1"), 1, "Explicit owner dismissal still applies to the selected identity");
             c.assertTrue(copy.isRemoved() && !f.helpers.data.agents.containsKey(id) && AgentCompanions.read(f.helpers.file).dismissed.contains(id)
                 && f.helpers.count(f.owner) == count - 1, "Dismissal removes the body and record, records proof and frees the slot");
-            var dismissedCopy = f.saved(UUID.fromString(id)); f.restart().load(dismissedCopy);
-            c.assertTrue(dismissedCopy.isRemoved(), "A later copy of a dismissed identity is retired, as the owner chose");
+            var dismissedCopy = f.saved(UUID.fromString(id)); f.helpers.load(dismissedCopy);
+            c.assertTrue(dismissedCopy.isRemoved(), "A later copy of the explicitly dismissed identity is retired in the same session");
+            var afterRestart = f.saved(UUID.fromString(id)); f.restart().load(afterRestart);
+            c.assertFalse(afterRestart.isRemoved(), "After restart the old record is ambiguous and the copy is kept"); afterRestart.discard();
         } finally { wire.channel.finishAndReleaseAll(); }
         c.succeed();
     }

@@ -310,6 +310,7 @@ public class AgentMenuGameTests {
             String warning = dismissalLore.stream().map(Component::getString).collect(java.util.stream.Collectors.joining(" "));
             c.assertTrue(warning.contains("saved copy") && warning.contains("cannot see") && warning.contains("edited stats"),
                 "Java confirmation warns about unseen copies and edited stats");
+            c.assertTrue(warning.contains("after restart") && warning.contains("host review"), "Java confirmation explains retention after restart");
             c.assertValueEqual(helpers.count(owner), 1, "Opening confirmation leaves the helper alive");
             click(owner, AgentMenu.CANCEL);
             c.assertValueEqual(helpers.count(owner), 1, "Cancel preserves the helper");
@@ -358,6 +359,7 @@ public class AgentMenuGameTests {
                 .map(Component::getString).collect(java.util.stream.Collectors.joining(" "));
             c.assertTrue(warning.contains("saved copy") && warning.contains("cannot see") && warning.contains("edited stats"),
                 "The command shows the same unseen-copy warning as the menu");
+            c.assertTrue(warning.contains("after restart") && warning.contains("host review"), "Java command confirmation explains retention after restart");
             c.assertTrue(helpers.data.agents.containsKey(id) && !body.isRemoved() && body.getHealth() == 37,
                 "Nothing is removed before Confirm");
             click(owner, AgentMenu.CANCEL);
