@@ -69,6 +69,7 @@ final class HelperPersistence {
      * a guarded roster write is proven durable.
      */
     static Path recoveryMarker(Path roster) { return roster.resolveSibling(roster.getFileName() + ".recovery-required"); }
+    static Path recoveryTemporary(Path roster) { return temporaryFile(recoveryMarker(roster)); }
 
     /** With {@code requireProof}, storage that cannot sync its directory refuses before the rename. */
     Durability replace(Path target, byte[] bytes, boolean keepPrevious, boolean requireProof) throws Failure {
@@ -122,14 +123,17 @@ final class HelperPersistence {
         if (Files.exists(roster, LinkOption.NOFOLLOW_LINKS)) return null;
         if (!Files.notExists(roster, LinkOption.NOFOLLOW_LINKS))
             return "whether " + roster.getFileName() + " exists cannot be determined";
-        for (Path evidence : new Path[]{previousFile(roster), recoveryMarker(roster), temporaryFile(roster)})
+        for (Path evidence : new Path[]{previousFile(roster), recoveryMarker(roster), recoveryTemporary(roster), temporaryFile(roster)})
             if (!Files.notExists(evidence, LinkOption.NOFOLLOW_LINKS))
                 return roster.getFileName() + " is missing but " + evidence.getFileName() + " may exist";
         return null;
     }
 
-    /** Any entry at the marker path, readable or not, means recovery is still required. */
-    static boolean recoveryRequired(Path roster) { return !Files.notExists(recoveryMarker(roster), LinkOption.NOFOLLOW_LINKS); }
+    /** An unfinished marker write is evidence too. Never overwrite or ignore it. */
+    static boolean recoveryRequired(Path roster) {
+        return !Files.notExists(recoveryMarker(roster), LinkOption.NOFOLLOW_LINKS)
+            || !Files.notExists(recoveryTemporary(roster), LinkOption.NOFOLLOW_LINKS);
+    }
 
     /** Best-effort note after a failure; never overwrites an existing marker. */
     void markRecoveryRequired(Path roster, String reason) throws Failure {
@@ -143,7 +147,7 @@ final class HelperPersistence {
      * any other failure may have left one. An existing marker is never reused.
      */
     void beginGuard(Path roster, String reason) throws Failure {
-        if (recoveryRequired(roster)) throw new Failure("A recovery marker already exists at " + recoveryMarker(roster), true, null);
+        if (recoveryRequired(roster)) throw new Failure("Recovery evidence already exists beside " + roster, true, null);
         replace(recoveryMarker(roster), (reason + "\n").getBytes(StandardCharsets.UTF_8), false, true);
     }
 

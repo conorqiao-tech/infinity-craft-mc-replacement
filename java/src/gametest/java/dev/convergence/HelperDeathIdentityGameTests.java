@@ -173,14 +173,14 @@ public class HelperDeathIdentityGameTests {
         try(var f=new Fixture(c)) {
             var pending=f.spawn("mismatch-marker-failure");String id=pending.getStringUUID();byte[] before=Files.readAllBytes(f.helpers.file);
             f.helpers.loaded.remove(pending.getUUID(),pending);
-            Files.createDirectory(f.dir.resolve("agents.json.recovery-required.tmp"));
-            c.assertTrue(pending.hurtServer(c.getLevel(),pending.damageSources().genericKill(),10000)&&!pending.isAlive(),"Native mismatched death occurs even when marker creation fails");
+            var temporary=HelperPersistence.recoveryTemporary(f.helpers.file);Files.createDirectory(temporary);
+            c.assertTrue(pending.hurtServer(c.getLevel(),pending.damageSources().genericKill(),10000)&&!pending.isAlive(),"Native mismatched death occurs while temporary recovery evidence exists");
             c.assertTrue(f.helpers.creationRecoveryRequired&&f.helpers.data.pendingCreations.contains(id)&&!f.helpers.data.dismissed.contains(id),"Current process fails closed without removal proof");
-            c.assertTrue(Arrays.equals(before,Files.readAllBytes(f.helpers.file)),"Marker failure cannot rewrite the roster");
+            c.assertTrue(Arrays.equals(before,Files.readAllBytes(f.helpers.file)),"Recovery evidence cannot rewrite the roster");
             var restarted=new AgentCompanions(f.helpers.server,f.helpers.file);
-            c.assertTrue(restarted.data.pendingCreations.contains(id)&&!restarted.data.dismissed.contains(id),"Even a failed marker write leaves pending identity on disk");
-            // If the marker could not be written, a restart can be unfrozen. Do not claim otherwise.
-            c.assertFalse(restarted.creationRecoveryRequired,"Known limit: a failed marker write need not freeze the restarted runtime");
+            c.assertTrue(restarted.data.pendingCreations.contains(id)&&!restarted.data.dismissed.contains(id),"The pending identity stays on disk");
+            c.assertTrue(restarted.creationRecoveryRequired&&Files.isDirectory(temporary)&&Files.notExists(HelperPersistence.recoveryMarker(f.helpers.file)),
+                "Temporary recovery evidence is kept and freezes the restarted runtime without a final marker");
         }
         try(var f=new Fixture(c)) {
             var legacy=f.spawn("legacy");String id=legacy.getStringUUID();

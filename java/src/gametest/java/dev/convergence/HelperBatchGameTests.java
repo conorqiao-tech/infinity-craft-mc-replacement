@@ -727,6 +727,7 @@ public class HelperBatchGameTests {
             c.assertValueEqual(f.helpers.spawn(f.owner, "near"), 1, "Single creation is saved durably");
             c.assertValueEqual(f.helpers.spawnBatch(f.owner, 2, AgentCompanions.Profile.REGULAR), 2, "Batch creation is saved durably");
             f.legacy(f.helpers.owned(f.owner, "helper-1").getKey());
+            f.unloaded(f.owner.getUUID(), 1, "away-"); var awayEntry = f.helpers.owned(f.owner, "away-1"); String away = awayEntry.getKey();
             io.noDirectorySync = true;
             c.assertValueEqual(f.helpers.mode(f.owner, "near", AgentCompanions.Mode.GUARD), 1, "Movement changes save");
             c.assertValueEqual(f.helpers.profile(f.owner, "near", AgentCompanions.Profile.DEBUG), 1, "Profile changes save");
@@ -736,9 +737,9 @@ public class HelperBatchGameTests {
             byte[] roster = Files.readAllBytes(f.helpers.file);
             c.assertValueEqual(f.helpers.dismiss(f.owner, "near"), 0, "Dismissing a loaded helper is refused where no durable marker can be made");
             c.assertTrue(f.helpers.data.agents.get(near.getKey()) == near.getValue() && nearEntity.isAlive() && !nearEntity.isRemoved()
-                && Arrays.equals(roster, Files.readAllBytes(f.helpers.file)) && !f.helpers.creationRecoveryRequired && Files.notExists(f.marker()),
-                "The refusal happens before any change and does not freeze");
-            f.unloaded(f.owner.getUUID(), 1, "away-"); var awayEntry = f.helpers.owned(f.owner, "away-1"); String away = awayEntry.getKey();
+                && Arrays.equals(roster, Files.readAllBytes(f.helpers.file)) && f.helpers.creationRecoveryRequired
+                && Files.notExists(f.marker()) && Files.exists(HelperPersistence.recoveryTemporary(f.helpers.file)),
+                "The refusal keeps the records and freezes while the temporary note remains");
             roster = Files.readAllBytes(f.helpers.file);
             c.assertValueEqual(f.helpers.dismiss(f.owner, "away-1"), 0, "Dismissing an unloaded helper is refused too");
             c.assertTrue(f.helpers.data.agents.get(away) == awayEntry.getValue() && Arrays.equals(roster, Files.readAllBytes(f.helpers.file)),
@@ -748,13 +749,13 @@ public class HelperBatchGameTests {
             roster = Files.readAllBytes(f.helpers.file);
             c.assertTrue(batchEntity.hurtServer(c.getLevel(), batchEntity.damageSources().genericKill(), 10000) && !batchEntity.isAlive(), "A real native death occurs");
             var saved = AgentCompanions.read(f.helpers.file);
-            c.assertTrue(saved.agents.get(batchId).equals(batch.getValue()) && saved.dismissed.isEmpty() && !f.helpers.creationRecoveryRequired
+            c.assertTrue(saved.agents.get(batchId).equals(batch.getValue()) && saved.dismissed.isEmpty() && f.helpers.creationRecoveryRequired
                 && Arrays.equals(roster, Files.readAllBytes(f.helpers.file)),
-                "Death keeps the saved record, writes nothing, adds no removal proof and does not freeze");
+                "Death keeps the saved record and does not add removal proof while frozen");
             for (var restart : List.<java.util.function.Supplier<AgentCompanions>>of(() -> f.helpers, () -> f.restart(io), f::restart)) {
                 var helpers = restart.get(); var copy = f.saved(UUID.fromString(batchId)); helpers.load(copy);
-                c.assertTrue(!copy.isRemoved() && helpers.loaded.get(copy.getUUID()) == copy,
-                    "A later saved copy keeps its preserved record and registers, before and after restart, even on storage that can sync later");
+                c.assertTrue(helpers.creationRecoveryRequired && !copy.isRemoved() && helpers.loaded.get(copy.getUUID()) == copy,
+                    "The temporary note freezes before and after restart and the later saved copy keeps its record");
                 helpers.loaded.remove(copy.getUUID(), copy); copy.discard();
             }
         }
@@ -790,10 +791,15 @@ public class HelperBatchGameTests {
             Files.delete(f.marker()); Files.createDirectory(f.marker());
             c.assertTrue(f.restart().creationRecoveryRequired, "A directory at the marker path also freezes");
             Files.delete(f.marker());
-            Files.writeString(f.marker().resolveSibling(f.marker().getFileName() + ".tmp"), "never renamed");
+            Path temporary = HelperPersistence.recoveryTemporary(f.helpers.file);
+            Files.writeString(temporary, "never renamed");
             var resolved = f.restart(); var copy = f.saved(UUID.fromString(away)); resolved.load(copy);
-            c.assertTrue(!resolved.creationRecoveryRequired && copy.isRemoved(),
-                "With the marker removed, a leftover unrenamed temporary file is ignored and the proven dismissal applies");
+            c.assertTrue(resolved.creationRecoveryRequired && !copy.isRemoved() && Files.readString(temporary).equals("never renamed"),
+                "A leftover unrenamed temporary note freezes restart and keeps both evidence and the saved helper");
+            new HelperPersistence(HelperPersistence.NATIVE).markRecoveryRequired(f.helpers.file, "must not overwrite");
+            c.assertTrue(Files.notExists(f.marker()) && Files.readString(temporary).equals("never renamed"),
+                "A temporary recovery note is not overwritten or replaced by a later note");
+            copy.discard();
         }
         var io = new FaultyIo();
         try (var f = new Fixture(c, io)) {
@@ -805,6 +811,22 @@ public class HelperBatchGameTests {
             var restarted = f.restart(); var copy = f.saved(UUID.fromString(f.helpers.owned(f.owner, "kept").getKey())); restarted.load(copy);
             c.assertTrue(!restarted.creationRecoveryRequired && !copy.isRemoved(),
                 "Known limit: without the note a restart is not frozen, but with no removal proof it can only keep the helper");
+            restarted.loaded.remove(copy.getUUID(), copy); copy.discard();
+        }
+        io = new FaultyIo();
+        try (var f = new Fixture(c, io)) {
+            f.helpers.spawn(f.owner, "kept"); String id = f.helpers.owned(f.owner, "kept").getKey();
+            io.arm("move:agents.json", true); io.arm("write:agents.json.recovery-required.tmp", true);
+            c.assertValueEqual(f.helpers.mode(f.owner, "kept", AgentCompanions.Mode.STAY), 0,
+                "An ambiguous roster write followed by an interrupted note does not report success");
+            Path temporary = HelperPersistence.recoveryTemporary(f.helpers.file);
+            c.assertTrue(f.helpers.creationRecoveryRequired && Files.notExists(f.marker()) && Files.exists(temporary),
+                "The interrupted note remains as recovery evidence without a final marker");
+            byte[] evidence = Files.readAllBytes(temporary), savedRoster = Files.readAllBytes(f.helpers.file);
+            var restarted = f.restart(); var copy = f.saved(UUID.fromString(id)); restarted.load(copy);
+            c.assertTrue(restarted.creationRecoveryRequired && !copy.isRemoved() && Arrays.equals(evidence, Files.readAllBytes(temporary))
+                && Arrays.equals(savedRoster, Files.readAllBytes(f.helpers.file)),
+                "A restart with an interrupted note freezes and preserves the saved helper, roster and note");
             restarted.loaded.remove(copy.getUUID(), copy); copy.discard();
         }
         c.succeed();
@@ -1030,8 +1052,12 @@ public class HelperBatchGameTests {
                 c.assertValueEqual(f.helpers.dismiss(f.owner, "near"), 0, "An uncertain marker write refuses the dismissal: " + label);
                 c.assertTrue(Arrays.equals(roster, Files.readAllBytes(f.helpers.file)) && f.helpers.data.agents.get(entry.getKey()) == entry.getValue()
                     && live.isAlive() && !live.isRemoved(), "The roster, record and helper are unchanged: " + label);
-                c.assertTrue(f.helpers.creationRecoveryRequired && Files.exists(f.marker()) && f.restart().creationRecoveryRequired,
-                    "A marker that may exist freezes now and after restart: " + label);
+                c.assertTrue(f.helpers.creationRecoveryRequired && HelperPersistence.recoveryRequired(f.helpers.file)
+                    && f.restart().creationRecoveryRequired,
+                    "A final or temporary note freezes now and after restart: " + label);
+                if (markerFault.getKey().startsWith("move:") && !markerFault.getValue())
+                    c.assertTrue(Files.notExists(f.marker()) && Files.exists(HelperPersistence.recoveryTemporary(f.helpers.file)),
+                        "A failed rename preserves its temporary note: " + label);
             }
         }
         c.succeed();
@@ -1191,8 +1217,9 @@ public class HelperBatchGameTests {
             var partial = c.getLevel().getEntity(inserted.get());
             c.assertTrue(partial == null || (!partial.isRemoved() && f.helpers.loaded.get(inserted.get()) == partial), "A new helper that reached the world is kept");
             var restarted = f.restart(); var copy = f.saved(inserted.get()); restarted.load(copy);
-            c.assertTrue(!copy.isRemoved() && restarted.loaded.get(copy.getUUID()) == copy,
-                "With no marker a restart is not frozen, but the copy keeps its record and registers; nothing is deleted");
+            c.assertTrue(restarted.creationRecoveryRequired && Files.isDirectory(markerTemporary)
+                && !copy.isRemoved() && restarted.loaded.get(copy.getUUID()) == copy,
+                "The temporary recovery evidence freezes restart and the saved copy keeps its record");
             copy.discard();
         } finally { wire.channel.finishAndReleaseAll(); }
         c.succeed();
@@ -1377,7 +1404,7 @@ public class HelperBatchGameTests {
             c.assertTrue(f.restart().creationRecoveryRequired && Arrays.equals(backup, Files.readAllBytes(f.previousFile())),
                 "Every restart stays frozen; nothing is restored or deleted automatically");
 
-            for (String suffix : List.of(".recovery-required", ".tmp")) {
+            for (String suffix : List.of(".recovery-required", ".recovery-required.tmp", ".tmp")) {
                 Path roster = f.directory.resolve("evidence" + suffix).resolve("agents.json"); Files.createDirectories(roster.getParent());
                 Path left = roster.resolveSibling("agents.json" + suffix); Files.writeString(left, "left by an earlier interrupted save");
                 var helpers = new AgentCompanions(server, roster);
