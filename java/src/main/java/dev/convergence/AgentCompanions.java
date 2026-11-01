@@ -72,7 +72,7 @@ public final class AgentCompanions {
     /** Removal proofs known to be durable on disk; only these may authorize deleting a saved entity. */
     Set<String> provenRemoved = new HashSet<>();
     static final int DISMISSED_LIMIT = 256;
-    static final String FROZEN = "Helper ownership is frozen for host review. Ask the host to inspect the roster, its .previous copy and its .recovery-required note.";
+    static final String FROZEN = "Helper ownership is frozen for host review. Ask the host to preserve the roster, its .previous copy and any .recovery-required or temporary note.";
     final Map<UUID, IronGolem> loaded = new HashMap<>();
     final Map<UUID, Integer> lastAttack = new HashMap<>();
     final Map<UUID, PlayerTarget> playerTargets = new HashMap<>();
@@ -186,11 +186,11 @@ public final class AgentCompanions {
         // ownership frozen. Nothing here may resolve it automatically.
         creationRecoveryRequired = absent != null || HelperPersistence.recoveryRequired(file);
         if (absent != null)
-            org.slf4j.LoggerFactory.getLogger("Infinity helpers").error("Helper ownership is frozen: {}. Nothing was restored, replaced or removed; inspect {}, its .previous copy and any .recovery-required note before restarting.",
+            org.slf4j.LoggerFactory.getLogger("Infinity helpers").error("Helper ownership is frozen: {}. Nothing was restored, replaced or removed; preserve {}, its .previous copy and any .recovery-required or temporary note for investigation.",
                 absent, file);
         else if (creationRecoveryRequired)
-            org.slf4j.LoggerFactory.getLogger("Infinity helpers").error("Helper ownership is frozen by {}. Inspect {} and its .previous copy, then remove the marker before restarting.",
-                HelperPersistence.recoveryMarker(file), file);
+            org.slf4j.LoggerFactory.getLogger("Infinity helpers").error("Helper ownership is frozen by recovery evidence beside {}. Preserve the roster, its .previous copy, {} and {}; investigate the matching whole-world data or restore a verified matching whole-world backup before any recovery.",
+                file, HelperPersistence.recoveryMarker(file), HelperPersistence.recoveryTemporary(file));
         // Removal proofs read at startup count only once the roster as read is
         // itself synced; otherwise stale copies are kept inert, never deleted.
         else if (persistence.proveExisting(file)) provenRemoved = new HashSet<>(data.guardedRemovals);
@@ -376,7 +376,8 @@ public final class AgentCompanions {
         if (creationRecoveryRequired) return "Nothing was changed. " + FROZEN;
         try { persistence.beginGuard(file, clock.instant() + " " + reason); return null; }
         catch (HelperPersistence.Failure failure) {
-            if (!failure.mayHaveChanged) return "This server's storage could not durably record a safe removal, so nothing was changed.";
+            if (!failure.mayHaveChanged && !HelperPersistence.recoveryRequired(file))
+                return "This server's storage could not durably record a safe removal, so nothing was changed.";
             freeze("a removal marker may or may not have been written", failure);
             return "The saved roster was not changed, but a recovery note may have been left. " + FROZEN;
         }
@@ -398,7 +399,7 @@ public final class AgentCompanions {
         log.error("Helper ownership is frozen: {}. Inspect {} and its .previous copy.", reason, file, failure);
         try { persistence.markRecoveryRequired(file, clock.instant() + " " + reason); }
         catch (HelperPersistence.Failure markerFailure) {
-            log.error("Could not record {}; a restart will not stay frozen", HelperPersistence.recoveryMarker(file), markerFailure);
+            log.error("Could not complete {}; a restart may not stay frozen if no recovery evidence survives", HelperPersistence.recoveryMarker(file), markerFailure);
         }
     }
     private byte[] rosterBytes() { return CommunityServer.GSON.toJson(data).getBytes(java.nio.charset.StandardCharsets.UTF_8); }
