@@ -563,6 +563,14 @@ public final class AgentCompanions {
             notifyRecoveryOwner(golem.getStringUUID(), "Multiple helper bodies have the same identity. Both were kept and the identity still uses a helper slot; ask the host to inspect them. " + FROZEN);
             return;
         }
+        if (creationRecoveryRequired) {
+            // The roster may name an uncertain body. Stop its behavior without
+            // applying profile defaults or rewriting saved ownership/name tags.
+            halt(golem); golem.removeFreeWill();
+            ((AgentGoalAccess) golem).infinity$getTargetSelector().removeAllGoals(goal -> true);
+            golem.setPersistenceRequired(); loaded.put(golem.getUUID(), golem);
+            return;
+        }
         prepare(golem); tags(golem, agent); loaded.put(golem.getUUID(), golem);
     }
     /** A tagged helper without a record is removed only with proven durable removal proof while not frozen. */
@@ -797,17 +805,16 @@ public final class AgentCompanions {
         return switch (create(owner.level(), staged)) {
             case CREATED -> reply(owner, created);
             case NOT_SAVED -> { reply(owner, "Could not save helper ownership. Nothing spawned. " + (creationRecoveryRequired ? FROZEN : "Check server storage before retrying.")); yield 0; }
-            case NOT_INSERTED -> reply(owner, "Could not spawn a helper here.");
             case FROZEN -> { reply(owner, "No helper entity spawned, but the saved roster may or may not now list it. " + FROZEN); yield 0; }
             case UNRESOLVED -> refuse(owner, UNRESOLVED_CREATION + name + " may have appeared and was kept; its ownership needs host review. " + FROZEN);
         };
     }
     /**
-     * UNRESOLVED: insertion failed after ownership was saved and the rollback
-     * could not safely finish. Some new helpers may be in the world; ownership
+     * UNRESOLVED: insertion failed after ownership was saved, or the guard
+     * could not be retired. Some new helpers may be in the world; ownership
      * is frozen and its records and entities are kept for host review.
      */
-    private enum Creation { CREATED, NOT_SAVED, NOT_INSERTED, FROZEN, UNRESOLVED }
+    private enum Creation { CREATED, NOT_SAVED, FROZEN, UNRESOLVED }
     static final String UNRESOLVED_CREATION = "Helper creation could not be fully confirmed. ";
     /**
      * The durable roster records every new identity as pending before insertion.
@@ -857,33 +864,15 @@ public final class AgentCompanions {
             creationUnresolved = true;
             return Creation.UNRESOLVED;
         }
-        var rollback = Commit.UNTOUCHED;
-        try {
-            // Only this creation's brand-new identities are removed, and only after
-            // their removal proof is proven durable. The creation save already
-            // retained the original .previous file; do not replace that recovery
-            // copy with the failed staged roster.
-            if (!creationRecoveryRequired) rollback = commit(() -> staged.keySet().forEach(golem -> {
-                data.agents.remove(golem.getStringUUID()); data.pendingCreations.remove(golem.getStringUUID()); rememberRemoved(golem.getStringUUID());
-            }), Save.GUARDED, false);
-            if (rollback == Commit.PROVEN && unguard()) {
-                // A normal discard is not death/dismissal and produces no drops.
-                for (var golem : staged.keySet()) { loaded.remove(golem.getUUID(), golem); AgentAvatars.remove(golem); golem.discard(); }
-                return Creation.NOT_INSERTED;
-            }
-        } catch (RuntimeException unexpected) { refused.addSuppressed(unexpected); }
-        // Fail closed without throwing, so the caller can still tell the player.
-        // A clean marker refusal still freezes this runtime: the batch may be
-        // partly inserted and must not be silently treated as created or absent.
-        if (!creationRecoveryRequired) freeze("a failed helper creation could not be rolled back safely", refused);
-        else org.slf4j.LoggerFactory.getLogger("Infinity helpers").error("A failed helper creation could not be rolled back safely; its helpers were kept for host review", refused);
+        // A staged UUID was checked against the roster, not every unloaded
+        // entity. Do not turn a failed insertion into removal proof for any
+        // later same-UUID body. Keep pending records and the established guard.
+        if (!creationRecoveryRequired) freeze("a failed helper insertion requires host review", refused);
+        else org.slf4j.LoggerFactory.getLogger("Infinity helpers").error("A failed helper insertion requires host review; its helpers were kept", refused);
         for (var golem : staged.keySet()) {
             try {
                 if (world.getEntity(golem.getUUID()) != golem || golem.isRemoved()) continue;
-                // Proven removal with its marker kept: unregister, keep inert. Otherwise
-                // memory still owns the staged helper, as the creation save did.
-                if (rollback == Commit.PROVEN) { loaded.remove(golem.getUUID(), golem); retireStale(golem); }
-                else loaded.putIfAbsent(golem.getUUID(), golem);
+                loaded.putIfAbsent(golem.getUUID(), golem);
             } catch (RuntimeException unexpected) {
                 org.slf4j.LoggerFactory.getLogger("Infinity helpers").error("Could not settle helper {} after a failed creation; it was not removed", golem.getUUID(), unexpected);
             }
@@ -925,7 +914,6 @@ public final class AgentCompanions {
         return switch (create(world, staged)) {
             case CREATED -> batchNotice(owner, count + " helpers appeared beside you • " + profile.label() + ", following. Your total: " + count(owner) + "/" + LIMIT + ".", count);
             case NOT_SAVED -> batchNotice(owner, "Could not save helper ownership. Nothing spawned. " + (creationRecoveryRequired ? FROZEN : "Check server storage before retrying."), 0);
-            case NOT_INSERTED -> batchNotice(owner, "The complete batch could not spawn. Its new helpers were removed; your existing helpers were kept.", 0);
             case FROZEN -> batchNotice(owner, "No helper entity spawned, but the saved roster may or may not now list them. " + FROZEN, 0);
             case UNRESOLVED -> batchNotice(owner, UNRESOLVED_CREATION + "Some of the " + count + " new helpers may have appeared and were kept; their ownership needs host review. " + FROZEN, 0);
         };
