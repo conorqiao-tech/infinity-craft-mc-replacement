@@ -131,8 +131,18 @@ final class HelperPersistence {
 
     /** An unfinished marker write is evidence too. Never overwrite or ignore it. */
     static boolean recoveryRequired(Path roster) {
-        return !Files.notExists(recoveryMarker(roster), LinkOption.NOFOLLOW_LINKS)
-            || !Files.notExists(recoveryTemporary(roster), LinkOption.NOFOLLOW_LINKS);
+        try {
+            return !Files.notExists(recoveryMarker(roster), LinkOption.NOFOLLOW_LINKS)
+                || !Files.notExists(recoveryTemporary(roster), LinkOption.NOFOLLOW_LINKS);
+        } catch (SecurityException denied) { return true; }
+    }
+
+    /** Check for a regular marker and no competing temporary note; this is not a writer-exclusion proof. */
+    static boolean guardIntact(Path roster) {
+        try {
+            return Files.isRegularFile(recoveryMarker(roster), LinkOption.NOFOLLOW_LINKS)
+                && Files.notExists(recoveryTemporary(roster), LinkOption.NOFOLLOW_LINKS);
+        } catch (SecurityException denied) { return false; }
     }
 
     /** Best-effort note after a failure; never overwrites an existing marker. */
@@ -158,7 +168,10 @@ final class HelperPersistence {
      */
     void endGuard(Path roster) throws Failure {
         Path marker = recoveryMarker(roster), directory = marker.toAbsolutePath().getParent();
-        try { io.delete(marker); io.syncDirectory(directory); }
+        try {
+            if (!guardIntact(roster)) throw new IOException("Recovery guard is missing or has competing temporary evidence");
+            io.delete(marker); io.syncDirectory(directory);
+        }
         catch (IOException | RuntimeException e) { throw new Failure("Could not prove " + marker.getFileName() + " was removed", true, e); }
     }
 }

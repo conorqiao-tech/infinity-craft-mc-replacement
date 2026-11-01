@@ -197,7 +197,7 @@ final class BedrockAgentMenu {
         }
         // Storage and frozen-ownership failures (spawn returns 0, or ownership
         // froze) are not fixed by moving; the chat notice gives the roster detail.
-        if (entry == null && (created != 1 || helpers.creationRecoveryRequired)) {
+        if (helpers.creationRecoveryRequired || (entry == null && created != 1)) {
             roster(owner, helpers.creationRecoveryRequired
                 ? (frozenBefore ? "Helper creation is blocked. " : "No helper entity spawned. ") + AgentCompanions.FROZEN
                 : "Could not save helper ownership. Nothing spawned. Ask the host to check server storage before retrying.", sender);
