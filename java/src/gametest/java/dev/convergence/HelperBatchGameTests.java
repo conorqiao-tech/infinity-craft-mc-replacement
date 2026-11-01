@@ -1217,8 +1217,9 @@ public class HelperBatchGameTests {
             var partial = c.getLevel().getEntity(inserted.get());
             c.assertTrue(partial == null || (!partial.isRemoved() && f.helpers.loaded.get(inserted.get()) == partial), "A new helper that reached the world is kept");
             var restarted = f.restart(); var copy = f.saved(inserted.get()); restarted.load(copy);
-            c.assertTrue(!copy.isRemoved() && restarted.loaded.get(copy.getUUID()) == copy,
-                "With no marker a restart is not frozen, but the copy keeps its record and registers; nothing is deleted");
+            c.assertTrue(restarted.creationRecoveryRequired && Files.isDirectory(markerTemporary)
+                && !copy.isRemoved() && restarted.loaded.get(copy.getUUID()) == copy,
+                "The temporary recovery evidence freezes restart and the saved copy keeps its record");
             copy.discard();
         } finally { wire.channel.finishAndReleaseAll(); }
         c.succeed();
